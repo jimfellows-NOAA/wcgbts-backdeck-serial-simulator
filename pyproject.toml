@@ -1,0 +1,35 @@
+[project]
+name = "wcgbts-backdeck-serial-simulator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
+    "ruff>=0.15.14",
+]
+
+[tool.ruff]
+# Set the maximum line length
+line-length = 100
+
+# Assume Python 3.13 (or whatever you pinned to)
+target-version = "py313"
+
+[tool.ruff.lint]
+# Enable Pyflakes (F), pycodestyle (E, W), isort (I), and flake8-bugbear (B)
+select = ["E", "F", "W", "I", "B"]
+
+# Ignore specific rules if necessary (e.g., line-length violations handled by formatter)
+ignore = []
+
+[tool.ruff.format]
+# Use double quotes for strings, just like Black
+quote-style = "double"
+# Indent with spaces, not tabs
+indent-style = "space"
