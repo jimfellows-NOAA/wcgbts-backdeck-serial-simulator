@@ -58,11 +58,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateVesselSpeed: (speed: number) => ipcRenderer.send('update-vessel-speed', speed),
   toggleVesselBreadcrumbs: (enabled: boolean) => ipcRenderer.send('toggle-vessel-breadcrumbs', enabled),
   
-  addVesselPort: (device: string, port: number, protocol: string, hz: number, baud: number) =>
-    ipcRenderer.invoke('add-vessel-port', { device, port, protocol, hz, baud }),
+  addVesselPort: (portConfig: any) =>
+    ipcRenderer.invoke('add-vessel-port', portConfig),
   
-  removeVesselPort: (port: number) =>
-    ipcRenderer.invoke('remove-vessel-port', port),
+  removeVesselPort: (id: string) =>
+    ipcRenderer.invoke('remove-vessel-port', id),
 
   onVesselState: (callback: (state: any) => void) => {
     const listener = (_event: any, state: any) => callback(state)

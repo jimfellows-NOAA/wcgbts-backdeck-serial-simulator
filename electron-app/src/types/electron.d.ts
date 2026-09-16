@@ -1,3 +1,15 @@
+export interface BroadcastPort {
+  id: string;
+  device: string;
+  protocol: 'SERIAL' | 'UDP' | 'TCP';
+  hz: number;
+  comPort?: string;
+  baud?: number;
+  host?: string;
+  netPort?: number;
+  sentences: string[];
+}
+
 export interface IElectronAPI {
   onLog: (callback: (msg: string) => void) => () => void;
   getAvailablePorts: () => Promise<string[]>;
@@ -20,8 +32,8 @@ export interface IElectronAPI {
   stopVesselSim: () => void;
   updateVesselSpeed: (speed: number) => void;
   toggleVesselBreadcrumbs: (enabled: boolean) => void;
-  addVesselPort: (device: string, port: number, protocol: string, hz: number, baud: number) => Promise<{ success: boolean, msg: string }>;
-  removeVesselPort: (port: number) => Promise<boolean>;
+  addVesselPort: (portConfig: BroadcastPort) => Promise<{ success: boolean, msg: string }>;
+  removeVesselPort: (id: string) => Promise<boolean>;
   onVesselState: (callback: (state: any) => void) => () => void;
   onVesselNmea: (callback: (nmea: string) => void) => () => void;
 }

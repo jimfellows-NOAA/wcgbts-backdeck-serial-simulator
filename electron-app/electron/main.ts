@@ -65,6 +65,255 @@ function calculate_destination(lat: number, lon: number, bearing: number, distan
   return [(newLatRad * 180) / Math.PI, (newLonRad * 180) / Math.PI]
 }
 
+interface BroadcastPort {
+  id: string
+  device: string
+  protocol: 'SERIAL' | 'UDP' | 'TCP'
+  hz: number
+  comPort?: string
+  baud?: number
+  host?: string
+  netPort?: number
+  sentences: string[]
+}
+
+interface PortRunnerInstance {
+  interval: NodeJS.Timeout | null
+  serFd?: number | null
+  udpSocket?: dgram.Socket | null
+  tcpServer?: net.Server | null
+  connectedSockets?: Set<net.Socket>
+}
+
+const activeRunners: Record<string, PortRunnerInstance> = {}
+
+function getPayloadForPort(portConfig: BroadcastPort): string {
+  const outSentences: string[] = []
+  let selectedHeaders = portConfig.sentences
+  if (!selectedHeaders || selectedHeaders.length === 0) {
+    selectedHeaders = DEVICE_GROUPS[portConfig.device] || []
+  }
+  for (const h of selectedHeaders) {
+    const s = state.latest_sentences[h]
+    if (s) {
+      outSentences.push(s)
+    }
+  }
+  return outSentences.join('')
+}
+
+function stopRunnerByResource(protocol: 'SERIAL' | 'UDP' | 'TCP', endpoint: string | number) {
+  // UDP outbound broadcasting does not lock the local port, so multiple devices can stream to it concurrently.
+  if (protocol === 'UDP') {
+    return
+  }
+
+  for (const id of Object.keys(activeRunners)) {
+    const portConfig = state.active_ports[id]
+    if (portConfig) {
+      if (portConfig.protocol === protocol) {
+        if (protocol === 'SERIAL' && portConfig.comPort === endpoint) {
+          logMessage(`[VesselSim] Conflict detected on ${endpoint}. Stopping old runner ${id}.`)
+          stopPortRunner(id)
+        } else if (protocol === 'TCP' && portConfig.netPort === endpoint) {
+          logMessage(`[VesselSim] Conflict detected on port ${endpoint}. Stopping old runner ${id}.`)
+          stopPortRunner(id)
+        }
+      }
+    }
+  }
+}
+
+function startPortRunner(portConfig: BroadcastPort) {
+  if (activeRunners[portConfig.id]) {
+    stopPortRunner(portConfig.id)
+  }
+
+  // Deconflict physical port collisions (COM or Network Ports)
+  if (portConfig.protocol === 'SERIAL') {
+    stopRunnerByResource('SERIAL', portConfig.comPort || '')
+  } else {
+    stopRunnerByResource(portConfig.protocol, portConfig.netPort || 10110)
+  }
+
+  const runner: PortRunnerInstance = {
+    interval: null
+  }
+
+  const hz = portConfig.hz || 1
+  const intervalMs = Math.floor(1000 / hz)
+
+  if (portConfig.protocol === 'SERIAL') {
+    const rawPort = portConfig.comPort || 'COM13'
+    const portPath = process.platform === 'win32' ? `\\\\.\\${rawPort.toUpperCase()}` : rawPort
+    try {
+      runner.serFd = fs.openSync(portPath, 'r+')
+      logMessage(`[VesselSim] Opened serial port ${rawPort} for broadcasting.`)
+    } catch (err: any) {
+      logMessage(`ERROR: Could not open serial port ${rawPort} for vessel broadcast: ${err.message}`)
+      runner.serFd = null
+    }
+
+    runner.interval = setInterval(() => {
+      if (state.current_mode !== 'Simulation' || runner.serFd === null || runner.serFd === undefined) {
+        return
+      }
+
+      const payload = getPayloadForPort(portConfig)
+      if (payload) {
+        try {
+          fs.writeSync(runner.serFd, Buffer.from(payload, 'ascii'))
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('vessel-nmea', {
+              protocol: portConfig.protocol,
+              payload: payload
+            })
+          }
+        } catch (err: any) {
+          // Normal if peer is closed/disconnected
+        }
+      }
+    }, intervalMs)
+
+  } else if (portConfig.protocol === 'UDP') {
+    const udpSocket = dgram.createSocket('udp4')
+    const host = portConfig.host || '127.0.0.1'
+    const netPort = portConfig.netPort || 10110
+
+    udpSocket.bind(0, () => {
+      try {
+        if (host === '255.255.255.255' || host.endsWith('.255')) {
+          udpSocket.setBroadcast(true)
+        }
+      } catch (err) {
+        // ignore setBroadcast errors
+      }
+    })
+
+    runner.udpSocket = udpSocket
+
+    runner.interval = setInterval(() => {
+      if (state.current_mode !== 'Simulation') {
+        return
+      }
+
+      const payload = getPayloadForPort(portConfig)
+      if (payload) {
+        try {
+          udpSocket.send(Buffer.from(payload, 'ascii'), netPort, host)
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('vessel-nmea', {
+              protocol: portConfig.protocol,
+              payload: payload
+            })
+          }
+        } catch (err) {
+          // ignore send errors
+        }
+      }
+    }, intervalMs)
+
+  } else if (portConfig.protocol === 'TCP') {
+    const netPort = portConfig.netPort || 10110
+    const host = portConfig.host || '127.0.0.1'
+    const connectedSockets = new Set<net.Socket>()
+
+    const server = net.createServer((socket) => {
+      connectedSockets.add(socket)
+      socket.on('close', () => connectedSockets.delete(socket))
+      socket.on('error', () => connectedSockets.delete(socket))
+    })
+
+    server.listen(netPort, host, () => {
+      logMessage(`[VesselSim] TCP Server listening on ${host}:${netPort} for ${portConfig.device}`)
+    })
+
+    server.on('error', (err: any) => {
+      logMessage(`[VesselSim] TCP Server Error on port ${netPort}: ${err.message}`)
+    })
+
+    runner.tcpServer = server
+    runner.connectedSockets = connectedSockets
+
+    runner.interval = setInterval(() => {
+      if (state.current_mode !== 'Simulation') {
+        return
+      }
+
+      const payload = getPayloadForPort(portConfig)
+      if (payload) {
+        if (connectedSockets.size > 0) {
+          const buf = Buffer.from(payload, 'ascii')
+          for (const s of connectedSockets) {
+            try {
+              s.write(buf)
+            } catch {
+              // Socket write failed, will be deleted on close/error
+            }
+          }
+        }
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('vessel-nmea', {
+            protocol: portConfig.protocol,
+            payload: payload
+          })
+        }
+      }
+    }, intervalMs)
+  }
+
+  activeRunners[portConfig.id] = runner
+}
+
+function stopPortRunner(id: string) {
+  const runner = activeRunners[id]
+  if (!runner) return
+
+  if (runner.interval) {
+    clearInterval(runner.interval)
+  }
+
+  if (runner.serFd !== null && runner.serFd !== undefined) {
+    try {
+      fs.closeSync(runner.serFd)
+    } catch {
+      // ignore
+    }
+  }
+
+  if (runner.udpSocket) {
+    try {
+      runner.udpSocket.close()
+    } catch {
+      // ignore
+    }
+  }
+
+  if (runner.tcpServer) {
+    try {
+      runner.tcpServer.close()
+    } catch {
+      // ignore
+    }
+    if (runner.connectedSockets) {
+      for (const s of runner.connectedSockets) {
+        try {
+          s.destroy()
+        } catch {
+          // ignore
+        }
+      }
+      runner.connectedSockets.clear()
+    }
+  }
+
+  delete activeRunners[id]
+  if (state.active_ports[id]) {
+    delete state.active_ports[id]
+  }
+  logMessage(`[VesselSim] Stopped broadcast runner for ID: ${id}`)
+}
+
 const state = {
   vessel: {
     lat: 38.035,
@@ -82,7 +331,7 @@ const state = {
   },
   track_history: [] as Array<[number, number, number]>,
   latest_sentences: {} as Record<string, string>,
-  active_ports: {} as Record<string, { port: number, protocol: string, hz: number, baud: number }>,
+  active_ports: {} as Record<string, BroadcastPort>,
   current_mode: 'Idle',
   clear_history() {
     this.track_history = []
@@ -138,6 +387,39 @@ function createWindow() {
 app.whenReady().then(() => {
   createWindow()
 
+  // Load existing broadcast ports on startup, sanitize legacy formats, and start their runners
+  try {
+    const config = loadConfigData()
+    if (config.vessel_ports && Array.isArray(config.vessel_ports)) {
+      const sanitizedList: BroadcastPort[] = []
+      for (const p of config.vessel_ports) {
+        const deviceName = p.device || 'GPS'
+        const defaultSentences = DEVICE_GROUPS[deviceName] || []
+        const mappedProto = p.protocol || 'UDP'
+        
+        const sanitized: BroadcastPort = {
+          ...p,
+          id: p.id || Math.random().toString(36).substring(2, 9),
+          sentences: p.sentences || defaultSentences,
+          protocol: mappedProto,
+          comPort: p.comPort || (mappedProto === 'SERIAL' ? (p.port ? `COM${p.port - 6000}` : 'COM13') : undefined),
+          netPort: p.netPort || (mappedProto !== 'SERIAL' ? (p.port || 10110) : undefined),
+          host: p.host || '127.0.0.1'
+        }
+        
+        sanitizedList.push(sanitized)
+        startPortRunner(sanitized)
+        state.active_ports[sanitized.id] = sanitized
+      }
+      
+      // Update config store immediately with cleaned data so legacy formats are migrated forever
+      config.vessel_ports = sanitizedList
+      saveConfigData(config)
+    }
+  } catch (err) {
+    console.error('Error starting initial port runners on boot:', err)
+  }
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow()
@@ -156,8 +438,8 @@ function cleanupThreads() {
     clearInterval(simInterval)
     simInterval = null
   }
-  for (const port of Object.keys(serverInstances).map(Number)) {
-    stopVesselPortLogic(port)
+  for (const id of Object.keys(activeRunners)) {
+    stopPortRunner(id)
   }
 }
 
@@ -641,11 +923,6 @@ ipcMain.on('start-vessel-sim', () => {
       }
     }
 
-    // Pipe 10Hz NMEA live log to Renderer
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('vessel-nmea', list.join(''))
-    }
-
     // Poll coordinate readout to Renderer (1Hz)
     if (loopCounter % 10 === 0) {
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -660,28 +937,6 @@ ipcMain.on('start-vessel-sim', () => {
           trackHistory: state.track_history,
           breadcrumbEnabled: state.vessel.breadcrumb_enabled
         })
-      }
-    }
-
-    // Stream out data to active ports
-    for (const [devName, info] of Object.entries(state.active_ports)) {
-      const headers = DEVICE_GROUPS[devName] || []
-      const outSentences: string[] = []
-      for (const h of headers) {
-        const payload = state.latest_sentences[h]
-        if (payload) {
-          outSentences.push(payload)
-        }
-      }
-      const dataPayload = outSentences.join('')
-      if (dataPayload) {
-        // Broadcast over TCP or UDP
-        if (info.protocol === 'UDP') {
-          const udpSocket = dgram.createSocket('udp4')
-          udpSocket.send(Buffer.from(dataPayload, 'ascii'), info.port, '255.255.255.255', () => {
-            udpSocket.close()
-          })
-        }
       }
     }
 
@@ -712,79 +967,56 @@ ipcMain.on('stop-vessel-sim', () => {
 })
 
 // --- VESSEL BROADCAST PORTS HANDLERS ---
-ipcMain.handle('add-vessel-port', (_event, { device, port, protocol, hz, baud }) => {
-  if (serverInstances[port]) {
-    return { success: false, msg: 'Port already active.' }
-  }
-
-  stopFlags[port] = false
-
-  if (protocol === 'UDP') {
-    // UDP Broadcaster handles broadcasting natively during the sim interval.
-    state.active_ports[device] = { port, protocol, hz, baud }
-    serverInstances[port] = { type: 'UDP' }
-    logMessage(`[VesselSim] Active broadcast: ${device} on Port ${port} (${protocol})`)
-    return { success: true, msg: `Configured UDP Broadcast on ${port}` }
-  } else {
-    // TCP or simulated Serial server
-    const server = net.createServer((socket) => {
-      const interval = setInterval(() => {
-        if (stopFlags[port]) {
-          clearInterval(interval)
-          socket.destroy()
-          return
-        }
-
-        const outSentences: string[] = []
-        const headers = DEVICE_GROUPS[device] || []
-        for (const h of headers) {
-          const s = state.latest_sentences[h]
-          if (s) {
-            outSentences.push(s)
-          }
-        }
-        const dataPayload = outSentences.join('')
-        if (dataPayload) {
-          socket.write(dataPayload, 'ascii')
-        }
-      }, Math.floor(1000 / hz))
-
-      socket.on('error', () => {
-        clearInterval(interval)
-      })
-
-      socket.on('close', () => {
-        clearInterval(interval)
-      })
-    })
-
-    server.listen(port, '127.0.0.1')
-    serverInstances[port] = server
-    state.active_ports[device] = { port, protocol, hz, baud }
-    logMessage(`[VesselSim] Active broadcast: ${device} on Port ${port} (${protocol})`)
-    return { success: true, msg: `TCP Server listening on Port ${port}` }
-  }
-})
-
-ipcMain.handle('remove-vessel-port', (_event, port) => {
-  stopVesselPortLogic(port)
-  return true
-})
-
-function stopVesselPortLogic(port: number) {
-  stopFlags[port] = true
-  const instance = serverInstances[port]
-  if (instance) {
-    if (instance.type !== 'UDP' && typeof instance.close === 'function') {
-      instance.close()
+ipcMain.handle('add-vessel-port', (_event, portConfig: BroadcastPort) => {
+  try {
+    if (!portConfig.id) {
+      portConfig.id = Math.random().toString(36).substring(2, 9)
     }
-    delete serverInstances[port]
-    delete stopFlags[port]
-  }
 
-  const dev = Object.keys(state.active_ports).find(k => state.active_ports[k].port === port)
-  if (dev) {
-    delete state.active_ports[dev]
+    startPortRunner(portConfig)
+
+    state.active_ports[portConfig.id] = portConfig
+
+    const config = loadConfigData()
+    const portsList: BroadcastPort[] = config.vessel_ports || []
+    
+    const existingIndex = portsList.findIndex(p => p.id === portConfig.id)
+    if (existingIndex >= 0) {
+      portsList[existingIndex] = portConfig
+    } else {
+      portsList.push(portConfig)
+    }
+    
+    config.vessel_ports = portsList
+    saveConfigData(config)
+
+    const label = portConfig.protocol === 'SERIAL'
+      ? portConfig.comPort
+      : `${portConfig.host}:${portConfig.netPort}`
+
+    return { success: true, msg: `Configured ${portConfig.protocol} broadcast on ${label}` }
+  } catch (err: any) {
+    return { success: false, msg: `Failed adding broadcast port: ${err.message}` }
   }
-  logMessage(`[VesselSim] Removed broadcast on Port ${port}`)
-}
+})
+
+ipcMain.handle('remove-vessel-port', (_event, id: string) => {
+  try {
+    stopPortRunner(id)
+
+    if (state.active_ports[id]) {
+      delete state.active_ports[id]
+    }
+
+    const config = loadConfigData()
+    const portsList: BroadcastPort[] = config.vessel_ports || []
+    const updated = portsList.filter(p => p.id !== id)
+    config.vessel_ports = updated
+    saveConfigData(config)
+
+    return true
+  } catch (err) {
+    console.error('Failed removing port:', err)
+    return false
+  }
+})
