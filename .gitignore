@@ -63,6 +63,10 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
+# Heavy Offline Map Datasets
+*.mbtiles
+data/maps/
+
 # ==============================================================================
 # OS, System, & Editor Specific Files
 # ==============================================================================
