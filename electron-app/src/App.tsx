@@ -2,10 +2,11 @@ import React, { useState, useEffect, useRef } from 'react'
 import DevicesTab from './components/DevicesTab'
 import TelemetryTab from './components/TelemetryTab'
 import VesselTab from './components/VesselTab'
+import NetworkTab from './components/NetworkTab'
 import { Terminal, ShieldCheck, Cpu } from 'lucide-react'
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'devices' | 'telemetry' | 'vessel'>('devices')
+  const [activeTab, setActiveTab] = useState<'devices' | 'telemetry' | 'vessel' | 'network'>('vessel')
   const [logs, setLogs] = useState<string[]>([])
   const logContainerRef = useRef<HTMLDivElement>(null)
 
@@ -40,7 +41,7 @@ export default function App() {
         <div className="flex items-center gap-3">
           <Cpu className="text-orange-500 w-6 h-6 animate-pulse" />
           <h1 className="text-md font-extrabold tracking-wider bg-gradient-to-r from-orange-400 to-amber-500 bg-clip-text text-transparent">
-            WCGBTS BACKDECK SIMULATOR
+            NWFSC VESSEL SIMULATOR
           </h1>
         </div>
         <div className="flex items-center gap-2 px-2.5 py-1 bg-emerald-950/50 border border-emerald-800/60 rounded-full text-xs text-emerald-400 font-semibold shadow-inner">
@@ -52,6 +53,16 @@ export default function App() {
       {/* --- TABBED NAVIGATION --- */}
       <nav className="flex px-4 bg-gray-900/60 border-b border-gray-800/50 text-sm font-medium">
         <button
+          onClick={() => setActiveTab('vessel')}
+          className={`px-5 py-2.5 border-b-2 transition-all ${
+            activeTab === 'vessel'
+              ? 'border-orange-500 text-orange-400 bg-orange-500/5 font-semibold'
+              : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/30'
+          }`}
+        >
+          Vessel Simulator
+        </button>
+        <button
           onClick={() => setActiveTab('devices')}
           className={`px-5 py-2.5 border-b-2 transition-all ${
             activeTab === 'devices'
@@ -59,7 +70,17 @@ export default function App() {
               : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/30'
           }`}
         >
-          Simulated Devices
+          Backdeck Devices
+        </button>
+        <button
+          onClick={() => setActiveTab('network')}
+          className={`px-5 py-2.5 border-b-2 transition-all ${
+            activeTab === 'network'
+              ? 'border-orange-500 text-orange-400 bg-orange-500/5 font-semibold'
+              : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/30'
+          }`}
+        >
+          Network Diagnostics
         </button>
         <button
           onClick={() => setActiveTab('telemetry')}
@@ -71,16 +92,6 @@ export default function App() {
         >
           Telemetry Forwarding
         </button>
-        <button
-          onClick={() => setActiveTab('vessel')}
-          className={`px-5 py-2.5 border-b-2 transition-all ${
-            activeTab === 'vessel'
-              ? 'border-orange-500 text-orange-400 bg-orange-500/5 font-semibold'
-              : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/30'
-          }`}
-        >
-          Vessel Simulator
-        </button>
       </nav>
 
       {/* --- ACTIVE TAB ELEMENT PANEL --- */}
@@ -89,6 +100,7 @@ export default function App() {
           {activeTab === 'devices' && <DevicesTab />}
           {activeTab === 'telemetry' && <TelemetryTab />}
           {activeTab === 'vessel' && <VesselTab />}
+          {activeTab === 'network' && <NetworkTab />}
         </div>
       </main>
 

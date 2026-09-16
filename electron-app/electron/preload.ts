@@ -56,6 +56,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startVesselSim: () => ipcRenderer.send('start-vessel-sim'),
   stopVesselSim: () => ipcRenderer.send('stop-vessel-sim'),
   updateVesselSpeed: (speed: number) => ipcRenderer.send('update-vessel-speed', speed),
+  updateVesselCoords: (lat: number, lon: number) => ipcRenderer.send('update-vessel-coords', { lat, lon }),
   toggleVesselBreadcrumbs: (enabled: boolean) => ipcRenderer.send('toggle-vessel-breadcrumbs', enabled),
   
   addVesselPort: (portConfig: any) =>
@@ -74,5 +75,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const listener = (_event: any, nmea: string) => callback(nmea)
     ipcRenderer.on('vessel-nmea', listener)
     return () => ipcRenderer.removeListener('vessel-nmea', listener)
-  }
+  },
+
+  getTile: (z: number, x: number, y: number) => ipcRenderer.invoke('get-tile', { z, x, y }),
+
+  // Tab 5: Network Diagnostics
+  runPing: (targetIp: string) => ipcRenderer.invoke('run-ping', targetIp),
+  mapDrive: (driveLetter: string, targetIp: string) => ipcRenderer.invoke('map-drive', { driveLetter, targetIp }),
+  runDriveSpeedTest: (path: string, sizeMb: number) => ipcRenderer.invoke('run-drive-speed-test', { path, sizeMb }),
+  exportDiagLogs: (summary: string, details: string) => ipcRenderer.invoke('export-diag-logs', { summary, details })
 })

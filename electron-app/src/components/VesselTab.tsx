@@ -75,6 +75,15 @@ export default function VesselTab() {
 
   // Live simulated NMEA logs terminal state
   const [nmeaLogs, setNmeaLogs] = useState<string[]>([])
+
+  // Manual coordinate input states
+  const [manualLat, setManualLat] = useState('38.035')
+  const [manualLon, setManualLon] = useState('-123.394')
+  const [geoLoading, setGeoLoading] = useState(false)
+
+  // Map Tile loader states
+  const [redrawTrigger, setRedrawTrigger] = useState(0)
+  const tileCacheRef = useRef<Record<string, HTMLImageElement>>({})
   
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const nmeaLogRef = useRef<HTMLDivElement>(null)
@@ -153,6 +162,27 @@ export default function VesselTab() {
     }
   }, [newProtocol])
 
+  const loadTileImage = (z: number, x: number, y: number) => {
+    const tileKey = `${z}_${x}_${y}`
+    if (tileCacheRef.current[tileKey] !== undefined) return // already loaded or loading
+
+    // mark as loading
+    tileCacheRef.current[tileKey] = null as any
+
+    window.electronAPI.getTile(z, x, y).then((base64Data) => {
+      if (base64Data) {
+        const img = new Image()
+        img.onload = () => {
+          tileCacheRef.current[tileKey] = img
+          setRedrawTrigger((prev) => prev + 1)
+        }
+        img.src = `data:image/jpeg;base64,${base64Data}`
+      }
+    }).catch(() => {
+      // ignore
+    })
+  }
+
   // Live Map Canvas rendering
   useEffect(() => {
     const canvas = canvasRef.current
@@ -162,7 +192,10 @@ export default function VesselTab() {
 
     const width = canvas.width
     const height = canvas.height
-    ctx.clearRect(0, 0, width, height)
+    
+    // Default background color mimicking ocean bathymetry before tiles load
+    ctx.fillStyle = '#0c1524'
+    ctx.fillRect(0, 0, width, height)
 
     const cx = width / 2
     const cy = height / 2
@@ -174,7 +207,16 @@ export default function VesselTab() {
       return [cx + dx, cy + dy]
     }
 
-    // 1. Draw grid lines (latitude / longitude)
+    // 1. Draw ESRI Ocean Bathymetry tiles if available
+    let z = 8
+    if (mapZoom < 2000) z = 7
+    else if (mapZoom < 4000) z = 8
+    else if (mapZoom < 8000) z = 9
+    else if (mapZoom < 15000) z = 10
+    else if (mapZoom < 25000) z = 11
+    else z = 12
+
+    const n = Math.pow(2, z)
     const lonSpan = (width / 2) / (mapZoom * cosLat)
     const latSpan = (height / 2) / mapZoom
 
@@ -183,11 +225,43 @@ export default function VesselTab() {
     const minLat = vessel.lat - latSpan
     const maxLat = vessel.lat + latSpan
 
+    const tileXMin = Math.floor(((minLon + 180) / 360) * n)
+    const tileXMax = Math.floor(((maxLon + 180) / 360) * n)
+
+    const toTileY = (lat: number) => {
+      const latClamped = Math.max(-85, Math.min(85, lat))
+      const latRad = (latClamped * Math.PI) / 180
+      return Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n)
+    }
+    const tileYMin = toTileY(maxLat)
+    const tileYMax = toTileY(minLat)
+
+    for (let tx = tileXMin; tx <= tileXMax; tx++) {
+      for (let ty = tileYMin; ty <= tileYMax; ty++) {
+        const tileKey = `${z}_${tx}_${ty}`
+        const cached = tileCacheRef.current[tileKey]
+        if (cached) {
+          const tileLonMin = tx / n * 360 - 180
+          const tileLatMax = Math.atan(Math.sinh(Math.PI * (1 - 2 * ty / n))) * 180 / Math.PI
+          const tileLonMax = (tx + 1) / n * 360 - 180
+          const tileLatMin = Math.atan(Math.sinh(Math.PI * (1 - 2 * (ty + 1) / n))) * 180 / Math.PI
+
+          const [x1, y1] = project(tileLatMax, tileLonMin)
+          const [x2, y2] = project(tileLatMin, tileLonMax)
+
+          ctx.drawImage(cached, x1, y1, x2 - x1, y2 - y1)
+        } else {
+          loadTileImage(z, tx, ty)
+        }
+      }
+    }
+
+    // 2. Draw grid lines (latitude / longitude) on top of the tiles
     const gridStep = 0.05
     const startLon = Math.floor(minLon / gridStep) * gridStep
     const startLat = Math.floor(minLat / gridStep) * gridStep
 
-    ctx.strokeStyle = '#1e293b' // slate-800
+    ctx.strokeStyle = 'rgba(30, 41, 59, 0.4)' // semi-transparent slate-800
     ctx.lineWidth = 1
     ctx.setLineDash([2, 4])
     ctx.font = '9px monospace'
@@ -213,7 +287,7 @@ export default function VesselTab() {
       ctx.fillText(`${lat.toFixed(2)}°N`, 4, y - 2)
     }
 
-    // 2. Draw WCGBTS survey boundary box (dotted orange)
+    // 3. Draw WCGBTS survey boundary box (dotted orange)
     const pts = [
       project(48.5, -125.5),
       project(48.5, -117.5),
@@ -233,7 +307,7 @@ export default function VesselTab() {
     ctx.fillStyle = '#f97316'
     ctx.fillText('WCGBTS Grid Box', pts[0][0] + 8, pts[0][1] + 12)
 
-    // 3. Draw trail (breadcrumbs)
+    // 4. Draw trail (breadcrumbs)
     if (vessel.breadcrumbEnabled && vessel.trackHistory.length > 1) {
       ctx.strokeStyle = '#38bdf8' // sky-400
       ctx.setLineDash([])
@@ -248,7 +322,7 @@ export default function VesselTab() {
       ctx.stroke()
     }
 
-    // 4. Draw Current Vessel (stylized triangle pointing to heading)
+    // 5. Draw Current Vessel (stylized triangle pointing to heading)
     ctx.setLineDash([])
     ctx.save()
     ctx.translate(cx, cy)
@@ -266,7 +340,7 @@ export default function VesselTab() {
     ctx.stroke()
     ctx.restore()
 
-  }, [vessel, mapZoom])
+  }, [vessel, mapZoom, redrawTrigger])
 
   useEffect(() => {
     if (nmeaLogRef.current) nmeaLogRef.current.scrollTop = nmeaLogRef.current.scrollHeight
@@ -282,15 +356,61 @@ export default function VesselTab() {
     window.electronAPI.saveConfig('vessel_speed', val)
   }
 
+  const handleZoomChange = (newZoom: number) => {
+    const clamped = Math.max(1000, Math.min(30000, newZoom))
+    setMapZoom(clamped)
+    window.electronAPI.saveConfig('vessel_zoom', clamped)
+  }
+
   const handleZoomSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = parseFloat(e.target.value)
-    setMapZoom(val)
-    window.electronAPI.saveConfig('vessel_zoom', val)
+    handleZoomChange(val)
   }
 
   const handleBreadcrumbsToggle = () => {
     const next = !vessel.breadcrumbEnabled
     window.electronAPI.toggleVesselBreadcrumbs(next)
+  }
+
+  const handleSetCoords = (lat: number, lon: number) => {
+    window.electronAPI.updateVesselCoords(lat, lon)
+    setManualLat(lat.toString())
+    setManualLon(lon.toString())
+  }
+
+  const handleUseGeolocation = () => {
+    if (!navigator.geolocation) {
+      alert('Geolocation is not supported by your operating system or computer.')
+      return
+    }
+
+    setGeoLoading(true)
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { latitude, longitude } = position.coords
+        handleSetCoords(latitude, longitude)
+        setGeoLoading(false)
+      },
+      (error) => {
+        alert(`Failed to retrieve current location: ${error.message}`)
+        setGeoLoading(false)
+      },
+      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+    )
+  }
+
+  const handleApplyManualCoords = () => {
+    const lat = parseFloat(manualLat)
+    const lon = parseFloat(manualLon)
+    if (isNaN(lat) || lat < -90 || lat > 90) {
+      alert('Please enter a valid Latitude between -90 and 90.')
+      return
+    }
+    if (isNaN(lon) || lon < -180 || lon > 180) {
+      alert('Please enter a valid Longitude between -180 and 180.')
+      return
+    }
+    handleSetCoords(lat, lon)
   }
 
   const addPort = async () => {
@@ -417,7 +537,7 @@ export default function VesselTab() {
             Status: {vessel.mode}
           </div>
 
-          <div className="flex-grow flex flex-col justify-center font-mono text-xs text-gray-300 gap-2 px-2">
+          <div className="flex-grow flex flex-col justify-center font-mono text-xs text-gray-300 gap-2 px-2 max-h-36">
             <div className="flex justify-between border-b border-gray-800/40 pb-1">
               <span>Latitude:</span>
               <span className="text-gray-100 font-bold">{vessel.lat.toFixed(6)}° N</span>
@@ -439,6 +559,78 @@ export default function VesselTab() {
               <span className="text-emerald-400 font-bold">{vessel.sweptArea.toFixed(2)} ha</span>
             </div>
           </div>
+
+          {/* Coordinates Setting Box */}
+          <div className="mt-4 bg-gray-900/50 p-3 rounded-lg border border-gray-800 flex flex-col gap-2.5 shrink-0">
+            <h5 className="text-[10px] font-bold text-gray-400 uppercase tracking-wider border-b border-gray-800 pb-1">
+              Set Vessel Coordinates
+            </h5>
+
+            {/* Presets */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[9px] font-bold text-gray-500 uppercase">Presets</span>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => handleSetCoords(33.60924687116191, -119.4452769936413)}
+                  className="px-2 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-500 text-gray-200 rounded text-[10px] font-semibold transition cursor-pointer"
+                >
+                  Channel Islands
+                </button>
+                <button
+                  onClick={() => handleSetCoords(44.63919065604716, -124.3498711799516)}
+                  className="px-2 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-500 text-gray-200 rounded text-[10px] font-semibold transition cursor-pointer"
+                >
+                  Newport
+                </button>
+              </div>
+            </div>
+
+            {/* Geolocation */}
+            <div className="flex flex-col gap-1.5 border-t border-gray-800/60 pt-2">
+              <button
+                onClick={handleUseGeolocation}
+                disabled={geoLoading}
+                className="w-full px-2 py-1 bg-blue-950/40 hover:bg-blue-900/40 border border-blue-800 hover:border-blue-600 disabled:opacity-50 text-blue-300 rounded text-[10px] font-semibold transition cursor-pointer flex items-center justify-center gap-1"
+              >
+                {geoLoading ? 'Fetching Location...' : 'Use My Current Location'}
+              </button>
+            </div>
+
+            {/* Manual Entry */}
+            <div className="flex flex-col gap-1.5 border-t border-gray-800/60 pt-2">
+              <span className="text-[9px] font-bold text-gray-500 uppercase">Manual Entry</span>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="flex flex-col gap-0.5 font-mono">
+                  <span className="text-[8px] font-bold text-gray-600">LATITUDE</span>
+                  <input
+                    type="number"
+                    step="0.000001"
+                    value={manualLat}
+                    onChange={(e) => setManualLat(e.target.value)}
+                    placeholder="e.g. 33.6092"
+                    className="bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-[10px] text-gray-300 focus:outline-none focus:border-orange-500 font-mono w-full"
+                  />
+                </div>
+                <div className="flex flex-col gap-0.5 font-mono">
+                  <span className="text-[8px] font-bold text-gray-600">LONGITUDE</span>
+                  <input
+                    type="number"
+                    step="0.000001"
+                    value={manualLon}
+                    onChange={(e) => setManualLon(e.target.value)}
+                    placeholder="e.g. -119.4452"
+                    className="bg-gray-800 border border-gray-700 rounded px-1.5 py-0.5 text-[10px] text-gray-300 focus:outline-none focus:border-orange-500 font-mono w-full"
+                  />
+                </div>
+              </div>
+              <button
+                onClick={handleApplyManualCoords}
+                className="w-full mt-1 px-2 py-1 bg-orange-950/40 hover:bg-orange-900/40 border border-orange-800 hover:border-orange-600 text-orange-300 rounded text-[10px] font-semibold transition cursor-pointer"
+              >
+                Apply Coordinates
+              </button>
+            </div>
+          </div>
         </div>
 
         {/* COLUMN 2: Native GIS Map Canvas */}
@@ -451,7 +643,31 @@ export default function VesselTab() {
             width={320}
             height={320}
             className="flex-grow w-full h-full block"
+            onWheel={(e) => {
+              e.preventDefault()
+              const delta = -e.deltaY
+              const zoomFactor = delta > 0 ? 1.15 : 0.85
+              handleZoomChange(mapZoom * zoomFactor)
+            }}
           ></canvas>
+
+          {/* Bottom Left Map Zoom Controls Overlay */}
+          <div className="absolute bottom-3 left-3 z-10 flex flex-col gap-1 shadow-md">
+            <button
+              onClick={() => handleZoomChange(mapZoom * 1.25)}
+              title="Zoom In"
+              className="w-7 h-7 flex items-center justify-center bg-gray-900/90 hover:bg-gray-800 border border-gray-800 hover:border-gray-600 rounded text-gray-200 hover:text-white font-bold text-md transition cursor-pointer select-none active:scale-95"
+            >
+              +
+            </button>
+            <button
+              onClick={() => handleZoomChange(mapZoom / 1.25)}
+              title="Zoom Out"
+              className="w-7 h-7 flex items-center justify-center bg-gray-900/90 hover:bg-gray-800 border border-gray-800 hover:border-gray-600 rounded text-gray-200 hover:text-white font-bold text-md transition cursor-pointer select-none active:scale-95"
+            >
+              −
+            </button>
+          </div>
         </div>
 
         {/* COLUMN 3: Ports Config & Live Sentences Stream Monitor */}

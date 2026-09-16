@@ -1,16 +1,15 @@
+import math
 import os
+import random
 import re
+import socket
+import sqlite3
 import sys
 import threading
 import time
 import tkinter as tk
-import socket
-import sqlite3
-import math
-import random
-import queue
-from datetime import datetime, timezone
 from collections import deque
+from datetime import datetime, timezone
 from tkinter import messagebox, ttk
 
 import serial
@@ -18,9 +17,9 @@ import serial.tools.list_ports
 
 # Optional GIS and replay dependencies
 try:
+    import geopandas as gpd
     import numpy as np
     import pandas as pd
-    import geopandas as gpd
     from shapely.geometry import Point
     HAS_REPLAY_GIS = True
 except ImportError:
@@ -399,7 +398,7 @@ def file_replay_thread(filename, stop_event):
             with STATE.lock:
                 formatted_sentence = sentence.strip() + "\r\n"
                 STATE.latest_sentences[header] = formatted_sentence
-                
+
                 if STATE.app:
                     STATE.app.log_vessel_nmea(formatted_sentence)
 
@@ -756,7 +755,7 @@ class ConfigDB:
 class HardwareSimulatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("WCGBTS Backdeck Hardware Simulator")
+        self.root.title("NWFSC Vessel Simulator")
         self.root.geometry("850x850")
 
         # Initialize SQLite configuration DB
@@ -830,10 +829,10 @@ class HardwareSimulatorApp:
     def refresh_ports(self):
         """Refreshes the COM port dropdowns for all devices, printers, and mappings."""
         available_ports = self.get_available_ports()
-        
+
         # Query active ports registered in the OS
         detected_ports = [port.device for port in serial.tools.list_ports.comports()]
-        
+
         for device in self.devices + self.printers:
             if device in self.port_vars:
                 self.port_vars[device]["values"] = available_ports
@@ -852,7 +851,7 @@ class HardwareSimulatorApp:
             self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
             self.log_text.see(tk.END)  # Auto-scroll to bottom
             self.log_text.config(state=tk.DISABLED)
-        
+
         try:
             self.root.after(0, _insert)
         except Exception:
@@ -1259,7 +1258,7 @@ class HardwareSimulatorApp:
         # Simple micro comboboxes for optional parameters
         vport_sub_frame = tk.Frame(v_ports_col)
         vport_sub_frame.pack(fill=tk.X, pady=2)
-        
+
         tk.Label(vport_sub_frame, text="Hz:").pack(side=tk.LEFT)
         self.vessel_hz_cb = ttk.Combobox(vport_sub_frame, values=["1 Hz", "10 Hz"], width=4, state="readonly")
         self.vessel_hz_cb.set("1 Hz")
@@ -1637,7 +1636,7 @@ class HardwareSimulatorApp:
                     self.com_stream_text.delete("1.0", f"{lines - 200}.0")
             self.com_stream_text.see(tk.END)
             self.com_stream_text.config(state=tk.DISABLED)
-        
+
         try:
             self.root.after(0, _insert)
         except Exception:
@@ -1655,7 +1654,7 @@ class HardwareSimulatorApp:
                     self.udp_stream_text.delete("1.0", f"{lines - 200}.0")
             self.udp_stream_text.see(tk.END)
             self.udp_stream_text.config(state=tk.DISABLED)
-        
+
         try:
             self.root.after(0, _insert)
         except Exception:
@@ -2034,7 +2033,7 @@ class HardwareSimulatorApp:
                     self.log_message(f"[VesselSim] Auto-started broadcast port: {dev_name} on {port} ({protocol})")
                 else:
                     self.log_message(f"[VesselSim] Warning: Could not auto-start port {port}: {msg}")
-                    
+
         for thread in threads_to_start:
             thread.start()
 
@@ -2058,7 +2057,7 @@ class HardwareSimulatorApp:
                             tree[year][vessel] = files
             except Exception as e:
                 self.log_message(f"[VesselSim] Error reading parquet data structure: {e}")
-                        
+
         self.vessel_file_tree = tree
         years = list(tree.keys())
         if years:
@@ -2250,7 +2249,7 @@ class HardwareSimulatorApp:
                     self.vessel_nmea_text.delete("1.0", f"{lines - 200}.0")
             self.vessel_nmea_text.see(tk.END)
             self.vessel_nmea_text.config(state=tk.DISABLED)
-        
+
         try:
             self.root.after(0, _insert)
         except Exception:

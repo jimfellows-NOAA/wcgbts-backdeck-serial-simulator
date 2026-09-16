@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import net from 'node:net'
 import dgram from 'node:dgram'
 import dns from 'node:dns'
+import child_process from 'node:child_process'
+import os from 'node:os'
 
 // --- JSON Configuration Storage ---
 const configPath = path.join(app.getPath('userData'), 'vessel_simulator_config.json')
@@ -361,7 +363,9 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 850,
     height: 850,
-    icon: path.join(__dirname, '../serial_port.ico'),
+    icon: process.env.VITE_DEV_SERVER_URL
+      ? path.join(__dirname, '../../serial_port.ico')
+      : path.join(__dirname, '../dist/serial_port.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -869,6 +873,26 @@ ipcMain.on('toggle-vessel-breadcrumbs', (_event, enabled) => {
   state.vessel.breadcrumb_enabled = enabled
 })
 
+ipcMain.on('update-vessel-coords', (_event, { lat, lon }) => {
+  state.vessel.lat = parseFloat(lat)
+  state.vessel.lon = parseFloat(lon)
+  state.clear_history() // clear old historical crumbs so they reset to new starting location
+  
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('vessel-state', {
+      mode: state.current_mode,
+      lat: state.vessel.lat,
+      lon: state.vessel.lon,
+      speed: state.vessel.sog_knots,
+      depth: state.vessel.seafloor_depth,
+      sweptArea: state.vessel.area_swept_kpi,
+      heading: state.vessel.heading,
+      trackHistory: state.track_history,
+      breadcrumbEnabled: state.vessel.breadcrumb_enabled
+    })
+  }
+})
+
 ipcMain.on('start-vessel-sim', () => {
   if (simInterval) {
     return
@@ -1019,4 +1043,167 @@ ipcMain.handle('remove-vessel-port', (_event, id: string) => {
     console.error('Failed removing port:', err)
     return false
   }
+})
+
+// --- TAB 5: NETWORK DIAGNOSTICS HANDLERS ---
+ipcMain.handle('run-ping', async (_event, targetIp: string) => {
+  return new Promise((resolve) => {
+    const isWin = process.platform === 'win32'
+    const cmd = 'ping'
+    const args = isWin ? ['-n', '4', targetIp] : ['-c', '4', targetIp]
+
+    const child = child_process.spawn(cmd, args, {
+      windowsHide: true
+    })
+
+    let stdout = ''
+    let stderr = ''
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString()
+    })
+    child.stderr.on('data', (data) => {
+      stderr += data.toString()
+    })
+
+    child.on('close', (code) => {
+      resolve({
+        success: code === 0,
+        output: stdout || stderr || `Ping finished with code ${code}`
+      })
+    })
+  })
+})
+
+ipcMain.handle('map-drive', async (_event, { driveLetter, targetIp }) => {
+  return new Promise((resolve) => {
+    const uncPath = `\\\\${targetIp}\\c`
+    
+    child_process.exec(`net use ${driveLetter}: /delete /y`, { windowsHide: true }, () => {
+      child_process.exec(`net use ${driveLetter}: "${uncPath}" /persistent:yes`, { windowsHide: true }, (err, stdout, stderr) => {
+        if (err) {
+          resolve({ success: false, output: stderr || stdout || err.message })
+        } else {
+          resolve({ success: true, output: stdout || `Mapped ${driveLetter}: drive to ${uncPath} successfully.` })
+        }
+      })
+    })
+  })
+})
+
+ipcMain.handle('run-drive-speed-test', async (_event, { path: drivePath, sizeMb }) => {
+  let targetDir = drivePath
+  
+  if (drivePath === 'C:\\' || drivePath === 'C:/') {
+    targetDir = app.getPath('temp')
+  }
+
+  try {
+    if (!fs.existsSync(targetDir)) {
+      return { success: false, speedMbSec: 0, duration: 0, msg: `Drive path not accessible: ${drivePath}` }
+    }
+  } catch (err: any) {
+    return { success: false, speedMbSec: 0, duration: 0, msg: `Drive path access denied: ${err.message}` }
+  }
+
+  const testFileLocal = path.join(app.getPath('temp'), `diag_local_test_${sizeMb}mb.tmp`)
+  const testFileTarget = path.join(targetDir, `diag_vessel_speed_test_${sizeMb}mb.tmp`)
+
+  try {
+    // Generate buffer
+    const buf = Buffer.alloc(sizeMb * 1024 * 1024, 0xAF)
+    fs.writeFileSync(testFileLocal, buf)
+
+    const startTime = Date.now()
+    fs.copyFileSync(testFileLocal, testFileTarget)
+    const durationSec = (Date.now() - startTime) / 1000
+
+    try { fs.unlinkSync(testFileLocal) } catch {}
+    try { fs.unlinkSync(testFileTarget) } catch {}
+
+    const speedSec = sizeMb / durationSec
+    return {
+      success: true,
+      speedMbSec: parseFloat(speedSec.toFixed(2)),
+      duration: parseFloat(durationSec.toFixed(2)),
+      msg: `Write succeeded. Speed: ${speedSec.toFixed(2)} MB/s (${durationSec.toFixed(2)}s)`
+    }
+  } catch (err: any) {
+    try { fs.unlinkSync(testFileLocal) } catch {}
+    try { fs.unlinkSync(testFileTarget) } catch {}
+    return { success: false, speedMbSec: 0, duration: 0, msg: `Write test failed: ${err.message}` }
+  }
+})
+
+ipcMain.handle('export-diag-logs', async (_event, { summary, details }) => {
+  try {
+    const downloadsDir = path.join(os.homedir(), 'Downloads')
+    const timestamp = new Date().toISOString().replace(/[:T]/g, '-').substring(0, 19)
+    const filename = `Vessel_Diagnostics_${timestamp}.txt`
+    const filepath = path.join(downloadsDir, filename)
+
+    let content = "=== VESSEL DIAGNOSTICS REPORT ===\n"
+    content += `Generated: ${new Date().toLocaleString()}\n`
+    content += "=================================\n\n"
+    content += "--- SUMMARY RESULTS ---\n"
+    content += summary
+    content += "\n\n--- DETAILED LOGS ---\n"
+    content += details
+
+    fs.writeFileSync(filepath, content, 'utf8')
+    return { success: true, msg: `Saved successfully to ${filepath}` }
+  } catch (err: any) {
+    return { success: false, msg: `Export failed: ${err.message}` }
+  }
+})
+
+ipcMain.handle('get-tile', async (_event, { z, x, y }) => {
+  return new Promise((resolve) => {
+    const baseDir = app.getAppPath()
+    const dbPath = path.isAbsolute(baseDir)
+      ? path.join(baseDir, '../data/maps/esri_ocean_1_12.mbtiles')
+      : path.resolve(path.join(baseDir, '../data/maps/esri_ocean_1_12.mbtiles'))
+    const scriptPath = path.isAbsolute(baseDir)
+      ? path.join(baseDir, '../data/maps/get_tile.py')
+      : path.resolve(path.join(baseDir, '../data/maps/get_tile.py'))
+
+    if (!fs.existsSync(dbPath)) {
+      logMessage(`[MapTiles] Error: Database not found at ${dbPath}`)
+      return resolve(null)
+    }
+    if (!fs.existsSync(scriptPath)) {
+      logMessage(`[MapTiles] Error: Python script not found at ${scriptPath}`)
+      return resolve(null)
+    }
+
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3'
+
+    const child = child_process.spawn(pythonCmd, [scriptPath, dbPath, z.toString(), x.toString(), y.toString()], {
+      windowsHide: true
+    })
+
+    let stdoutBase64 = ''
+    let stderr = ''
+
+    child.stdout.on('data', (data) => {
+      stdoutBase64 += data.toString()
+    })
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString()
+    })
+
+    child.on('close', (code) => {
+      if (code === 0 && stdoutBase64) {
+        resolve(stdoutBase64)
+      } else {
+        if (stderr) {
+          logMessage(`[MapTiles] Python Error: ${stderr.trim()}`)
+        } else if (code !== 0) {
+          logMessage(`[MapTiles] Python exited with code ${code}`)
+        }
+        resolve(null)
+      }
+    })
+  })
 })

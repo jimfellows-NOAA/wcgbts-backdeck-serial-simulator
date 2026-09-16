@@ -1,7 +1,7 @@
 {
   "name": "wcgbts-hardware-simulator",
   "version": "1.0.0",
-  "description": "WCGBTS Vessel and Backdeck Hardware Simulator",
+  "description": "NWFSC Vessel Simulator",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
@@ -29,7 +29,7 @@
   },
   "build": {
     "appId": "com.wcgbts.backdeck-serial-simulator",
-    "productName": "WCGBTS Hardware Simulator",
+    "productName": "NWFSC Vessel Simulator",
     "win": {
       "target": "portable"
     },

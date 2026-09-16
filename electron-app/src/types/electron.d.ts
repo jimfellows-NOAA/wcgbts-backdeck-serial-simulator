@@ -31,11 +31,18 @@ export interface IElectronAPI {
   startVesselSim: () => void;
   stopVesselSim: () => void;
   updateVesselSpeed: (speed: number) => void;
+  updateVesselCoords: (lat: number, lon: number) => void;
   toggleVesselBreadcrumbs: (enabled: boolean) => void;
   addVesselPort: (portConfig: BroadcastPort) => Promise<{ success: boolean, msg: string }>;
   removeVesselPort: (id: string) => Promise<boolean>;
   onVesselState: (callback: (state: any) => void) => () => void;
   onVesselNmea: (callback: (nmea: string) => void) => () => void;
+  getTile: (z: number, x: number, y: number) => Promise<string | null>;
+
+  runPing: (targetIp: string) => Promise<{ success: boolean, output: string }>;
+  mapDrive: (driveLetter: string, targetIp: string) => Promise<{ success: boolean, output: string }>;
+  runDriveSpeedTest: (path: string, sizeMb: number) => Promise<{ success: boolean, speedMbSec: number, duration: number, msg: string }>;
+  exportDiagLogs: (summary: string, details: string) => Promise<{ success: boolean, msg: string }>;
 }
 
 declare global {
