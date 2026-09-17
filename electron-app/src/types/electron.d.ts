@@ -31,6 +31,12 @@ export interface IElectronAPI {
   startVesselSim: () => void;
   stopVesselSim: () => void;
   updateVesselSpeed: (speed: number) => void;
+  updateWindSpeed: (speed: number) => void;
+  updateWindDir: (dir: number) => void;
+  updateDepthSet: (depth: number) => void;
+  updateTempSet: (temp: number) => void;
+  steerLeft: () => void;
+  steerRight: () => void;
   updateVesselCoords: (lat: number, lon: number) => void;
   toggleVesselBreadcrumbs: (enabled: boolean) => void;
   addVesselPort: (portConfig: BroadcastPort) => Promise<{ success: boolean, msg: string }>;

@@ -213,7 +213,7 @@ export default function DevicesTab() {
                 </div>
 
                 {/* Visual Label Tag Output Preview Box */}
-                <div className="h-28 bg-white border border-gray-400 rounded p-3 overflow-hidden select-text text-black shadow-inner font-mono text-[10px] leading-tight">
+                <div className="h-28 bg-gray-950 border border-gray-800 rounded p-3 overflow-hidden select-text text-emerald-400 shadow-inner font-mono text-[10px] leading-tight">
                   <pre className="whitespace-pre-wrap font-mono h-full overflow-y-auto">
                     {printerLabels[printerName]}
                   </pre>

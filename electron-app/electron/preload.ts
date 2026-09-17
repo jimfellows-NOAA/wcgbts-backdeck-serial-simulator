@@ -56,6 +56,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startVesselSim: () => ipcRenderer.send('start-vessel-sim'),
   stopVesselSim: () => ipcRenderer.send('stop-vessel-sim'),
   updateVesselSpeed: (speed: number) => ipcRenderer.send('update-vessel-speed', speed),
+  updateWindSpeed: (speed: number) => ipcRenderer.send('update-wind-speed', speed),
+  updateWindDir: (dir: number) => ipcRenderer.send('update-wind-dir', dir),
+  updateDepthSet: (depth: number) => ipcRenderer.send('update-depth-set', depth),
+  updateTempSet: (temp: number) => ipcRenderer.send('update-temp-set', temp),
+  steerLeft: () => ipcRenderer.send('steer-left'),
+  steerRight: () => ipcRenderer.send('steer-right'),
   updateVesselCoords: (lat: number, lon: number) => ipcRenderer.send('update-vessel-coords', { lat, lon }),
   toggleVesselBreadcrumbs: (enabled: boolean) => ipcRenderer.send('toggle-vessel-breadcrumbs', enabled),
   

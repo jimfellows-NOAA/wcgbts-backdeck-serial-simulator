@@ -43,7 +43,7 @@ DEVICE_GROUPS = {
     "GPS": ["$GPGLL", "$GPHDT", "$GPRMC", "$GPVTG"],
     "ITI_Trawl_System": ["$IIDBS", "$IIGLL", "@IIHFB", "@IIMTW", "@IITDS", "@IITPT"],
     "Furuno_Attitude_Heave": ["$PFEC,GPatt", "$PFEC,GPhve"],
-    "Echosounder_Depth_Temp": ["$SDDBS", "$SDDBT", "$SDDPT", "$SDMTW"],
+    "Echosounder_Depth_Temp": ["$SDDBS", "$SDDBT", "$SDDPT", "$SDMTW", "$YCMTW"],
     "$PSIMP,D1": ["$PSIMP,D1"],
     "$PSIMTV80": ["$PSIMTV80"],
     "$WIMWV": ["$WIMWV"]
@@ -78,8 +78,17 @@ class AppState:
         self.lock = threading.Lock()
         self.vessel_state = {
             "lat": 38.035, "lon": -123.394, "sog_knots": 0.0, "heading": 0.0, "track": 0.0,
-            "seafloor_depth": 0.0, "pitch": 0.0, "roll": 0.0, "heave": 0.0,
-            "default_speed": 10.0, "area_swept_kpi": 0.0, "breadcrumb_enabled": True
+            "seafloor_depth": 300.0, "pitch": 0.0, "roll": 0.0, "heave": 0.0,
+            "default_speed": 10.0, "area_swept_kpi": 0.0, "breadcrumb_enabled": True,
+            "wind_speed_set": 5.0,
+            "wind_dir_set": 240.0,
+            "wind_speed": 5.0,
+            "wind_dir": 240.0,
+            "depth_set": 300.0,
+            "temp_set": 12.0,
+            "water_temp": 12.0,
+            "wind_speed_relative": 5.0,
+            "wind_dir_relative": 240.0
         }
         self.track_history = deque(maxlen=200)
         self.server_threads = {}
@@ -180,7 +189,7 @@ def gen_iihfb(state, now):
 
 @register_generator("@IIMTW")
 def gen_iimtw(state, now):
-    return f"@IIMTW,{random.uniform(2.0, 8.5):.1f},C\r\n"
+    return f"@IIMTW,{state.get('water_temp', 12.0):.1f},C\r\n"
 
 
 @register_generator("@IITDS")
@@ -275,14 +284,22 @@ def gen_sddpt(state, now):
 
 @register_generator("$SDMTW")
 def gen_sdmtw(state, now):
-    body = f"SDMTW,{random.uniform(9.0, 15.0):.1f},C"
+    body = f"SDMTW,{state.get('water_temp', 12.0):.1f},C"
+    return f"${body}*{generate_checksum(body)}\r\n"
+
+
+@register_generator("$YCMTW")
+def gen_ycmtw(state, now):
+    body = f"YCMTW,{state.get('water_temp', 12.0):.1f},C"
     return f"${body}*{generate_checksum(body)}\r\n"
 
 
 @register_generator("$WIMWV")
 def gen_wimwv(state, now):
-    t_dir, t_spd = random.uniform(0, 359.9), random.uniform(5.0, 25.0)
-    r_ang, r_spd = (t_dir - state['track'] + random.uniform(-30, 30)) % 360, abs(t_spd + random.uniform(-2, 2))
+    t_dir = state.get('wind_dir', 240.0)
+    t_spd = state.get('wind_speed', 5.0)
+    r_ang = state.get('wind_dir_relative', 240.0)
+    r_spd = state.get('wind_speed_relative', 5.0)
     t_body, r_body = f"WIMWV,{t_dir:.1f},T,{t_spd:.1f},N,A", f"WIMWV,{r_ang:.1f},R,{r_spd:.1f},N,A"
     return f"${t_body}*{generate_checksum(t_body)}\r\n" + f"${r_body}*{generate_checksum(r_body)}\r\n"
 
@@ -317,20 +334,49 @@ def simulation_thread(stop_event):
                     track = (track + 180 + random.uniform(-45, 45)) % 360
 
             now = datetime.now(timezone.utc)
-            s_kts = STATE.vessel_state['default_speed'] * random.uniform(0.9, 1.1)
 
+            # Calculate active values based on base/setpoint values
+            w_spd_set = STATE.vessel_state.get('wind_speed_set', 5.0)
+            w_dir_set = STATE.vessel_state.get('wind_dir_set', 240.0)
+            d_set = STATE.vessel_state.get('depth_set', 300.0)
+            t_set = STATE.vessel_state.get('temp_set', 12.0)
+
+            # Wander +/- 10% around base values
+            active_wind_spd = w_spd_set * random.uniform(0.9, 1.1)
+            active_wind_dir = (w_dir_set + random.uniform(-5.0, 5.0)) % 360.0
+            active_depth = d_set * random.uniform(0.9, 1.1)
+            active_temp = t_set * random.uniform(0.9, 1.1)
+
+            # SOG and Track
+            s_kts = STATE.vessel_state['default_speed'] * random.uniform(0.9, 1.1)
             m_sec = s_kts * 0.514444
             if s_kts > 0:
                 track = (track + random.uniform(-1, 1)) % 360
             n_lat, n_lon = calculate_destination(
                 STATE.vessel_state['lat'], STATE.vessel_state['lon'], track, m_sec * 0.1
             )
-            depth = round(random.uniform(180, 450), 1)
+
+            # Apparent wind vector math:
+            # True wind direction (active_wind_dir) relative to bow (track):
+            theta_true_rel = (active_wind_dir - track) % 360.0
+            theta_true_rel_rad = math.radians(theta_true_rel)
+
+            # True wind components in ship-relative coords: x is starboard, y is forward.
+            # Forward motion of ship adds SOG as headwind (felt as a wind in the +y direction)
+            x_rel = active_wind_spd * math.sin(theta_true_rel_rad)
+            y_rel = active_wind_spd * math.cos(theta_true_rel_rad) + s_kts
+
+            active_wind_spd_rel = math.sqrt(x_rel**2 + y_rel**2)
+            active_wind_dir_rel = math.degrees(math.atan2(x_rel, y_rel)) % 360.0
 
             STATE.vessel_state.update({
                 'lat': n_lat, 'lon': n_lon, 'sog_knots': s_kts, 'track': track, 'heading': track,
-                'seafloor_depth': depth, 'pitch': random.uniform(-2, 2),
-                'roll': random.uniform(-4, 4), 'heave': random.uniform(-0.5, 0.5)
+                'seafloor_depth': round(active_depth, 1),
+                'water_temp': round(active_temp, 1),
+                'pitch': random.uniform(-2, 2),
+                'roll': random.uniform(-4, 4), 'heave': random.uniform(-0.5, 0.5),
+                'wind_speed': active_wind_spd, 'wind_dir': active_wind_dir,
+                'wind_speed_relative': active_wind_spd_rel, 'wind_dir_relative': active_wind_dir_rel
             })
 
             if loop_counter % 10 == 0:
@@ -756,7 +802,7 @@ class HardwareSimulatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("NWFSC Vessel Simulator")
-        self.root.geometry("850x850")
+        self.root.geometry("1326x1050")
 
         # Initialize SQLite configuration DB
         self.db = ConfigDB()
@@ -799,6 +845,12 @@ class HardwareSimulatorApp:
         self.vessel_speed_var = tk.DoubleVar(value=10.0)
         self.vessel_breadcrumbs_var = tk.BooleanVar(value=True)
         self.vessel_map_zoom_var = tk.DoubleVar(value=5000.0)  # pixels per degree
+        self.vessel_wind_speed_var = tk.DoubleVar(value=5.0)
+        self.vessel_wind_dir_var = tk.DoubleVar(value=240.0)
+        self.vessel_depth_var = tk.DoubleVar(value=300.0)
+        self.vessel_temp_var = tk.DoubleVar(value=12.0)
+        self.vessel_averaging_buffer = deque(maxlen=300)
+        self.poll_counter = 0
         self.vessel_file_tree = {}
 
         self.server_ip_var = tk.StringVar(value=self.db.get_setting("server_ip", "161.55.52.50"))
@@ -967,12 +1019,12 @@ class HardwareSimulatorApp:
             toggle_btn.pack(side=tk.LEFT)
 
             # Rendered Tag Box (Simulated Zebra Label Output)
-            lbl_frame = tk.Frame(p_col, bd=2, relief=tk.SOLID, bg="white", height=120)
+            lbl_frame = tk.Frame(p_col, bd=2, relief=tk.SOLID, bg="#020813", height=120)
             lbl_frame.pack(fill=tk.BOTH, expand=True, pady=5)
             lbl_frame.pack_propagate(False)
 
             preview_text = tk.Text(
-                lbl_frame, bg="white", fg="black", font=("Courier", 8), state=tk.DISABLED, bd=0
+                lbl_frame, bg="#020813", fg="#10b981", font=("Consolas", 8), state=tk.DISABLED, bd=0
             )
             preview_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
             self.printer_previews[printer] = preview_text
@@ -1164,13 +1216,23 @@ class HardwareSimulatorApp:
             ctrl_r2, from_=0.0, to=25.0, increment=0.1, textvariable=self.vessel_speed_var,
             width=4, command=self.update_vessel_speed_from_spin
         )
-        self.vessel_speed_spin.pack(side=tk.LEFT, padx=(0, 10))
+        self.vessel_speed_spin.pack(side=tk.LEFT, padx=(0, 5))
         self.vessel_speed_spin.bind("<Return>", lambda e: self.update_vessel_speed_from_spin())
+
+        # Steering buttons
+        tk.Button(
+            ctrl_r2, text="◀", font=("Arial", 8, "bold"), width=2, bg="lightgrey",
+            command=self.steer_left
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        tk.Button(
+            ctrl_r2, text="▶", font=("Arial", 8, "bold"), width=2, bg="lightgrey",
+            command=self.steer_right
+        ).pack(side=tk.LEFT, padx=(0, 10))
 
         # Map Zoom Control
         tk.Label(ctrl_r2, text="Map Zoom:").pack(side=tk.LEFT, padx=(0, 2))
         self.vessel_zoom_scale = tk.Scale(
-            ctrl_r2, from_=1000.0, to=30000.0, resolution=500.0, orient=tk.HORIZONTAL, showvalue=False,
+            ctrl_r2, from_=100.0, to=30000.0, resolution=100.0, orient=tk.HORIZONTAL, showvalue=False,
             variable=self.vessel_map_zoom_var, width=8
         )
         self.vessel_zoom_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
@@ -1180,6 +1242,70 @@ class HardwareSimulatorApp:
             command=self.toggle_vessel_breadcrumbs
         )
         self.vessel_bread_chk.pack(side=tk.LEFT)
+
+        # Control Row Wind: Speed & Direction setpoint sliders
+        ctrl_r_wind = tk.Frame(vessel_ctrl_frame)
+        ctrl_r_wind.pack(fill=tk.X, pady=3)
+
+        tk.Label(ctrl_r_wind, text="Wind Spd:").pack(side=tk.LEFT, padx=(0, 2))
+        self.vessel_wind_speed_scale = tk.Scale(
+            ctrl_r_wind, from_=0.0, to=50.0, resolution=0.1, orient=tk.HORIZONTAL, showvalue=False,
+            variable=self.vessel_wind_speed_var, command=self.update_wind_speed_from_slider, width=8
+        )
+        self.vessel_wind_speed_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.vessel_wind_speed_spin = tk.Spinbox(
+            ctrl_r_wind, from_=0.0, to=50.0, increment=0.1, textvariable=self.vessel_wind_speed_var,
+            width=4, command=self.update_wind_speed_from_spin
+        )
+        self.vessel_wind_speed_spin.pack(side=tk.LEFT, padx=(0, 10))
+        self.vessel_wind_speed_spin.bind("<Return>", lambda e: self.update_wind_speed_from_spin())
+
+        tk.Label(ctrl_r_wind, text="Wind Dir:").pack(side=tk.LEFT, padx=(0, 2))
+        self.vessel_wind_dir_scale = tk.Scale(
+            ctrl_r_wind, from_=0.0, to=359.9, resolution=1.0, orient=tk.HORIZONTAL, showvalue=False,
+            variable=self.vessel_wind_dir_var, command=self.update_wind_dir_from_slider, width=8
+        )
+        self.vessel_wind_dir_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.vessel_wind_dir_spin = tk.Spinbox(
+            ctrl_r_wind, from_=0.0, to=359.9, increment=1.0, textvariable=self.vessel_wind_dir_var,
+            width=4, command=self.update_wind_dir_from_spin
+        )
+        self.vessel_wind_dir_spin.pack(side=tk.LEFT, padx=(0, 10))
+        self.vessel_wind_dir_spin.bind("<Return>", lambda e: self.update_wind_dir_from_spin())
+
+        # Control Row Sounder: Depth & Temp setpoint sliders
+        ctrl_r_sounder = tk.Frame(vessel_ctrl_frame)
+        ctrl_r_sounder.pack(fill=tk.X, pady=3)
+
+        tk.Label(ctrl_r_sounder, text="Set Depth:").pack(side=tk.LEFT, padx=(0, 2))
+        self.vessel_depth_scale = tk.Scale(
+            ctrl_r_sounder, from_=10.0, to=1000.0, resolution=1.0, orient=tk.HORIZONTAL, showvalue=False,
+            variable=self.vessel_depth_var, command=self.update_depth_from_slider, width=8
+        )
+        self.vessel_depth_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.vessel_depth_spin = tk.Spinbox(
+            ctrl_r_sounder, from_=10.0, to=1000.0, increment=1.0, textvariable=self.vessel_depth_var,
+            width=4, command=self.update_depth_from_spin
+        )
+        self.vessel_depth_spin.pack(side=tk.LEFT, padx=(0, 10))
+        self.vessel_depth_spin.bind("<Return>", lambda e: self.update_depth_from_spin())
+
+        tk.Label(ctrl_r_sounder, text="Set Temp:").pack(side=tk.LEFT, padx=(0, 2))
+        self.vessel_temp_scale = tk.Scale(
+            ctrl_r_sounder, from_=-2.0, to=40.0, resolution=0.1, orient=tk.HORIZONTAL, showvalue=False,
+            variable=self.vessel_temp_var, command=self.update_temp_from_slider, width=8
+        )
+        self.vessel_temp_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        self.vessel_temp_spin = tk.Spinbox(
+            ctrl_r_sounder, from_=-2.0, to=40.0, increment=0.1, textvariable=self.vessel_temp_var,
+            width=4, command=self.update_temp_from_spin
+        )
+        self.vessel_temp_spin.pack(side=tk.LEFT, padx=(0, 10))
+        self.vessel_temp_spin.bind("<Return>", lambda e: self.update_temp_from_spin())
 
         # Control Row 3: Parquet File Replay Config (Hidden by default)
         self.vessel_replay_options_frame = tk.Frame(vessel_ctrl_frame)
@@ -1225,6 +1351,11 @@ class HardwareSimulatorApp:
 
         self.map_canvas = tk.Canvas(v_map_col, bg="#001423", bd=1, relief=tk.SOLID)
         self.map_canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Bind MouseWheel for map scroll zoom
+        self.map_canvas.bind("<MouseWheel>", self.on_map_scroll_zoom)
+        self.map_canvas.bind("<Button-4>", self.on_map_scroll_zoom)  # Linux scroll up
+        self.map_canvas.bind("<Button-5>", self.on_map_scroll_zoom)  # Linux scroll down
 
         # COLUMN 3: NMEA Ports & Live simulated sentences stream terminal
         v_ports_col = tk.LabelFrame(vessel_layout_container, text="Ports & NMEA Stream", padx=5, pady=5)
@@ -2021,6 +2152,54 @@ class HardwareSimulatorApp:
             with STATE.lock:
                 STATE.vessel_state['breadcrumb_enabled'] = enabled
 
+        saved_wind_speed = self.db.get_setting("vessel_wind_speed_set")
+        if saved_wind_speed:
+            try:
+                self.vessel_wind_speed_var.set(float(saved_wind_speed))
+                with STATE.lock:
+                    STATE.vessel_state['wind_speed_set'] = float(saved_wind_speed)
+            except ValueError:
+                pass
+        else:
+            with STATE.lock:
+                STATE.vessel_state['wind_speed_set'] = 5.0
+
+        saved_wind_dir = self.db.get_setting("vessel_wind_dir_set")
+        if saved_wind_dir:
+            try:
+                self.vessel_wind_dir_var.set(float(saved_wind_dir))
+                with STATE.lock:
+                    STATE.vessel_state['wind_dir_set'] = float(saved_wind_dir)
+            except ValueError:
+                pass
+        else:
+            with STATE.lock:
+                STATE.vessel_state['wind_dir_set'] = 240.0
+
+        saved_depth = self.db.get_setting("vessel_depth_set")
+        if saved_depth:
+            try:
+                self.vessel_depth_var.set(float(saved_depth))
+                with STATE.lock:
+                    STATE.vessel_state['depth_set'] = float(saved_depth)
+            except ValueError:
+                pass
+        else:
+            with STATE.lock:
+                STATE.vessel_state['depth_set'] = 300.0
+
+        saved_temp = self.db.get_setting("vessel_temp_set")
+        if saved_temp:
+            try:
+                self.vessel_temp_var.set(float(saved_temp))
+                with STATE.lock:
+                    STATE.vessel_state['temp_set'] = float(saved_temp)
+            except ValueError:
+                pass
+        else:
+            with STATE.lock:
+                STATE.vessel_state['temp_set'] = 12.0
+
         # Auto-start previously active broadcast ports
         saved_ports = self.db.get_vessel_sim_ports()
         threads_to_start = []
@@ -2167,11 +2346,99 @@ class HardwareSimulatorApp:
         except ValueError:
             pass
 
+    def steer_left(self):
+        """Steers the vessel 5 degrees to the left (counter-clockwise)."""
+        with STATE.lock:
+            track = (STATE.vessel_state.get('track', 0.0) - 5.0 + 360.0) % 360.0
+            STATE.vessel_state['track'] = track
+            STATE.vessel_state['heading'] = track
+        self.log_message(f"[VesselSim] Steered 5° LEFT. New heading: {track:.1f}°")
+
+    def steer_right(self):
+        """Steers the vessel 5 degrees to the right (clockwise)."""
+        with STATE.lock:
+            track = (STATE.vessel_state.get('track', 0.0) + 5.0) % 360.0
+            STATE.vessel_state['track'] = track
+            STATE.vessel_state['heading'] = track
+        self.log_message(f"[VesselSim] Steered 5° RIGHT. New heading: {track:.1f}°")
+
     def toggle_vessel_breadcrumbs(self):
         enabled = self.vessel_breadcrumbs_var.get()
         with STATE.lock:
             STATE.vessel_state['breadcrumb_enabled'] = enabled
         self.db.set_setting("vessel_sim_breadcrumbs", str(enabled))
+
+    def update_wind_speed_from_slider(self, val):
+        try:
+            speed = float(val)
+            with STATE.lock:
+                STATE.vessel_state['wind_speed_set'] = speed
+            self.db.set_setting("vessel_wind_speed_set", f"{speed:.1f}")
+        except ValueError:
+            pass
+
+    def update_wind_speed_from_spin(self):
+        try:
+            speed = self.vessel_wind_speed_var.get()
+            with STATE.lock:
+                STATE.vessel_state['wind_speed_set'] = speed
+            self.db.set_setting("vessel_wind_speed_set", f"{speed:.1f}")
+        except ValueError:
+            pass
+
+    def update_wind_dir_from_slider(self, val):
+        try:
+            dir_val = float(val)
+            with STATE.lock:
+                STATE.vessel_state['wind_dir_set'] = dir_val
+            self.db.set_setting("vessel_wind_dir_set", f"{dir_val:.1f}")
+        except ValueError:
+            pass
+
+    def update_wind_dir_from_spin(self):
+        try:
+            dir_val = self.vessel_wind_dir_var.get()
+            with STATE.lock:
+                STATE.vessel_state['wind_dir_set'] = dir_val
+            self.db.set_setting("vessel_wind_dir_set", f"{dir_val:.1f}")
+        except ValueError:
+            pass
+
+    def update_depth_from_slider(self, val):
+        try:
+            depth = float(val)
+            with STATE.lock:
+                STATE.vessel_state['depth_set'] = depth
+            self.db.set_setting("vessel_depth_set", f"{depth:.1f}")
+        except ValueError:
+            pass
+
+    def update_depth_from_spin(self):
+        try:
+            depth = self.vessel_depth_var.get()
+            with STATE.lock:
+                STATE.vessel_state['depth_set'] = depth
+            self.db.set_setting("vessel_depth_set", f"{depth:.1f}")
+        except ValueError:
+            pass
+
+    def update_temp_from_slider(self, val):
+        try:
+            temp = float(val)
+            with STATE.lock:
+                STATE.vessel_state['temp_set'] = temp
+            self.db.set_setting("vessel_temp_set", f"{temp:.1f}")
+        except ValueError:
+            pass
+
+    def update_temp_from_spin(self):
+        try:
+            temp = self.vessel_temp_var.get()
+            with STATE.lock:
+                STATE.vessel_state['temp_set'] = temp
+            self.db.set_setting("vessel_temp_set", f"{temp:.1f}")
+        except ValueError:
+            pass
 
     def add_vessel_sim_port_ui(self):
         dev_name = self.vessel_device_cb.get().strip()
@@ -2361,6 +2628,116 @@ class HardwareSimulatorApp:
             fill="#ff4500", outline="white", width=1
         )
 
+        # 5. Draw Nautical Dashboard in Top-Right Corner (Streamlined circular compass face)
+        if width > 120 and height > 120:
+            # Rounded rectangle helper function
+            def draw_rounded_rect(canvas, x1, y1, x2, y2, rad_val, **kwargs):
+                pts_list = [
+                    x1 + rad_val, y1, x1 + rad_val, y1, x2 - rad_val, y1, x2 - rad_val, y1, x2, y1,
+                    x2, y1 + rad_val, x2, y1 + rad_val, x2, y2 - rad_val, x2, y2 - rad_val, x2, y2,
+                    x2 - rad_val, y2, x2 - rad_val, y2, x1 + rad_val, y2, x1 + rad_val, y2, x1, y2,
+                    x1, y2 - rad_val, x1, y2 - rad_val, x1, y1 + rad_val, x1, y1 + rad_val, x1, y1
+                ]
+                return canvas.create_polygon(pts_list, **kwargs, smooth=True)
+
+            # Center of circular dial (adjusted down to make room for Title):
+            dx, dy = width - 60, 68
+            r = 34
+
+            # Draw background box for the compass with rounded corners
+            draw_rounded_rect(
+                self.map_canvas, width - 110, 10, width - 10, 110, 8,
+                fill="#06101e", outline="#1c2d3d", width=2
+            )
+
+            # Draw Title at the top
+            self.map_canvas.create_text(
+                width - 60, 21, text="WIND & VESSEL BEARING", fill="#5a7a8a", font=("Arial", 6, "bold")
+            )
+
+            # Compass Circle
+            self.map_canvas.create_oval(
+                dx - r, dy - r, dx + r, dy + r,
+                outline="#324a5e", width=1.5
+            )
+
+            # Cardinal directions (adjusted for r = 34)
+            self.map_canvas.create_text(dx, dy - r + 7, text="N", fill="white", font=("Arial", 6, "bold"))
+            self.map_canvas.create_text(dx, dy + r - 7, text="S", fill="white", font=("Arial", 6, "bold"))
+            self.map_canvas.create_text(dx + r - 7, dy, text="E", fill="white", font=("Arial", 6, "bold"))
+            self.map_canvas.create_text(dx - r + 7, dy, text="W", fill="white", font=("Arial", 6, "bold"))
+
+            # Draw Vessel Icon in the center (representing its heading)
+            rad_hdg = math.radians(heading)
+            cos_v, sin_v = math.cos(rad_hdg), math.sin(rad_hdg)
+            # Simple boat shape in the center of the dial (scaled for r = 34)
+            v_pts = [(0, -7), (-3, 4), (0, 1), (3, 4)]
+            rot_v_pts = []
+            for lx, ly in v_pts:
+                rx = lx * cos_v - ly * sin_v
+                ry = lx * sin_v + ly * cos_v
+                rot_v_pts.append((dx + rx, dy + ry))
+            self.map_canvas.create_polygon(
+                rot_v_pts[0][0], rot_v_pts[0][1],
+                rot_v_pts[1][0], rot_v_pts[1][1],
+                rot_v_pts[2][0], rot_v_pts[2][1],
+                rot_v_pts[3][0], rot_v_pts[3][1],
+                fill="#ff4500", outline="white", width=1
+            )
+
+            # Get current wind speed & direction from STATE
+            with STATE.lock:
+                t_wind_dir = STATE.vessel_state.get('wind_dir', 240.0)
+                r_wind_dir = STATE.vessel_state.get('wind_dir_relative', 240.0)
+
+            # Draw True Wind Indicator (Green Arrow pointing towards center)
+            rad_tw = math.radians(t_wind_dir)
+            tw_x_start = dx + (r - 2) * math.sin(rad_tw)
+            tw_y_start = dy - (r - 2) * math.cos(rad_tw)
+            tw_x_end = dx + (r - 11) * math.sin(rad_tw)
+            tw_y_end = dy - (r - 11) * math.cos(rad_tw)
+            self.map_canvas.create_line(
+                tw_x_start, tw_y_start, tw_x_end, tw_y_end,
+                fill="#00ff66", width=2, arrow=tk.LAST, arrowshape=(5, 7, 2)
+            )
+            # Label 'T' next to start
+            tw_lbl_x = dx + (r + 6) * math.sin(rad_tw)
+            tw_lbl_y = dy - (r + 6) * math.cos(rad_tw)
+            self.map_canvas.create_text(
+                tw_lbl_x, tw_lbl_y, text="T", fill="#00ff66", font=("Arial", 6, "bold")
+            )
+
+            # Draw Relative Wind Indicator (Orange Arrow pointing towards center)
+            # Relative wind angle on compass: heading + r_wind_dir
+            abs_rw_dir = (heading + r_wind_dir) % 360.0
+            rad_rw = math.radians(abs_rw_dir)
+            rw_x_start = dx + (r - 2) * math.sin(rad_rw)
+            rw_y_start = dy - (r - 2) * math.cos(rad_rw)
+            rw_x_end = dx + (r - 11) * math.sin(rad_rw)
+            rw_y_end = dy - (r - 11) * math.cos(rad_rw)
+            self.map_canvas.create_line(
+                rw_x_start, rw_y_start, rw_x_end, rw_y_end,
+                fill="#ff9900", width=1.5, dash=(2, 2), arrow=tk.LAST, arrowshape=(4, 6, 1.5)
+            )
+            # Label 'R' next to start
+            rw_lbl_x = dx + (r + 6) * math.sin(rad_rw)
+            rw_lbl_y = dy - (r + 6) * math.cos(rad_rw)
+            self.map_canvas.create_text(
+                rw_lbl_x, rw_lbl_y, text="R", fill="#ff9900", font=("Arial", 6, "bold")
+            )
+
+    def on_map_scroll_zoom(self, event):
+        """Manually zoom in or out using the mouse scroll wheel on the map canvas."""
+        # event.delta > 0 for Windows scroll up; event.num == 4 for Linux scroll up
+        if event.num == 4 or event.delta > 0:  # Zoom In
+            current = self.vessel_map_zoom_var.get()
+            new_zoom = min(30000.0, current + 500.0)
+            self.vessel_map_zoom_var.set(new_zoom)
+        elif event.num == 5 or event.delta < 0:  # Zoom Out
+            current = self.vessel_map_zoom_var.get()
+            new_zoom = max(1000.0, current - 500.0)
+            self.vessel_map_zoom_var.set(new_zoom)
+
     def poll_vessel_simulator_state(self):
         """Periodically polls the global shared AppState to update labels and map canvas redrawing."""
         try:
@@ -2370,7 +2747,27 @@ class HardwareSimulatorApp:
                 lon = STATE.vessel_state.get('lon', 0.0)
                 sog = STATE.vessel_state.get('sog_knots', 0.0)
                 depth = STATE.vessel_state.get('seafloor_depth', 0.0)
+                temp = STATE.vessel_state.get('water_temp', 12.0)
+                t_wind_spd = STATE.vessel_state.get('wind_speed', 5.0)
+                t_wind_dir = STATE.vessel_state.get('wind_dir', 240.0)
+                r_wind_spd = STATE.vessel_state.get('wind_speed_relative', 5.0)
+                r_wind_dir = STATE.vessel_state.get('wind_dir_relative', 240.0)
                 kpi = STATE.vessel_state.get('area_swept_kpi', 0.0)
+
+            # Sampling for rolling averages (1Hz)
+            self.poll_counter = getattr(self, 'poll_counter', 0) + 1
+            if self.poll_counter % 2 == 0:
+                with STATE.lock:
+                    self.vessel_averaging_buffer.append({
+                        'hdg': STATE.vessel_state.get('heading', 0.0),
+                        'sog': STATE.vessel_state.get('sog_knots', 0.0),
+                        'tws': STATE.vessel_state.get('wind_speed', 5.0),
+                        'twd': STATE.vessel_state.get('wind_dir', 240.0),
+                        'rws': STATE.vessel_state.get('wind_speed_relative', 5.0),
+                        'rwd': STATE.vessel_state.get('wind_dir_relative', 240.0),
+                        'dep': STATE.vessel_state.get('seafloor_depth', 300.0),
+                        'tmp': STATE.vessel_state.get('water_temp', 12.0)
+                    })
 
             # Update status header
             if mode == "File Replay":
@@ -2379,13 +2776,17 @@ class HardwareSimulatorApp:
                 self.vessel_status_label.config(text=f"Status: {mode}")
 
             # Update coordinates/speed readout console
-            self.vessel_info_label.config(
-                text=f"Latitude:   {lat:10.6f}° N\n"
-                     f"Longitude:  {lon:10.6f}° W\n"
-                     f"Vess Speed: {sog:10.2f} knots\n"
-                     f"Floor Depth:{depth:10.1f} meters\n"
-                     f"Area Swept: {kpi:10.2f} hectares"
+            readout = (
+                f"Latitude:    {lat:10.6f}° N\n"
+                f"Longitude:   {lon:10.6f}° W\n"
+                f"Vess Speed:  {sog:10.2f} knots\n"
+                f"Floor Depth: {depth:10.1f} meters\n"
+                f"Water Temp:  {temp:10.1f} °C\n"
+                f"True Wind:   {t_wind_spd:.1f}kts @ {t_wind_dir:.1f}°\n"
+                f"Rel Wind:    {r_wind_spd:.1f}kts @ {r_wind_dir:.1f}°\n"
+                f"Area Swept:  {kpi:10.2f} hectares"
             )
+            self.vessel_info_label.config(text=readout)
 
             # Redraw Native GIS Canvas map
             self.redraw_map_canvas()

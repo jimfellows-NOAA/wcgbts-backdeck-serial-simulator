@@ -36,7 +36,7 @@ const DEVICE_GROUPS: Record<string, string[]> = {
   "GPS": ["$GPGLL", "$GPHDT", "$GPRMC", "$GPVTG"],
   "ITI_Trawl_System": ["$IIDBS", "$IIGLL", "@IIHFB", "@IIMTW", "@IITDS", "@IITPT"],
   "Furuno_Attitude_Heave": ["$PFEC,GPatt", "$PFEC,GPhve"],
-  "Echosounder_Depth_Temp": ["$SDDBS", "$SDDBT", "$SDDPT", "$SDMTW"],
+  "Echosounder_Depth_Temp": ["$SDDBS", "$SDDBT", "$SDDPT", "$SDMTW", "$YCMTW"],
   "$PSIMP,D1": ["$PSIMP,D1"],
   "$PSIMTV80": ["$PSIMTV80"],
   "$WIMWV": ["$WIMWV"]
@@ -323,13 +323,24 @@ const state = {
     sog_knots: 0.0,
     heading: 0.0,
     track: 0.0,
-    seafloor_depth: 0.0,
+    seafloor_depth: 300.0,
     pitch: 0.0,
     roll: 0.0,
     heave: 0.0,
     area_swept_kpi: 0.0,
     default_speed: 10.0,
-    breadcrumb_enabled: true
+    breadcrumb_enabled: true,
+    // Setpoints
+    wind_speed_set: 5.0,
+    wind_dir_set: 240.0,
+    depth_set: 300.0,
+    temp_set: 12.0,
+    // Active values
+    wind_speed: 5.0,
+    wind_dir: 240.0,
+    water_temp: 12.0,
+    wind_speed_relative: 5.0,
+    wind_dir_relative: 240.0
   },
   track_history: [] as Array<[number, number, number]>,
   latest_sentences: {} as Record<string, string>,
@@ -338,6 +349,23 @@ const state = {
   clear_history() {
     this.track_history = []
   }
+}
+
+// Load initial setpoint values from config if present
+try {
+  const config = loadConfigData()
+  state.vessel.default_speed = parseFloat(config.vessel_speed || '10')
+  state.vessel.wind_speed_set = parseFloat(config.vessel_wind_speed_set || '5')
+  state.vessel.wind_dir_set = parseFloat(config.vessel_wind_dir_set || '240')
+  state.vessel.depth_set = parseFloat(config.vessel_depth_set || '300')
+  state.vessel.temp_set = parseFloat(config.vessel_temp_set || '12')
+  // Sync active values
+  state.vessel.wind_speed = state.vessel.wind_speed_set
+  state.vessel.wind_dir = state.vessel.wind_dir_set
+  state.vessel.seafloor_depth = state.vessel.depth_set
+  state.vessel.water_temp = state.vessel.temp_set
+} catch {
+  // ignore, use defaults
 }
 
 // Thread / interval states
@@ -361,8 +389,8 @@ function logMessage(msg: string) {
 // --- Window Lifecycle ---
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 850,
-    height: 850,
+    width: 1326,
+    height: 1050,
     icon: process.env.VITE_DEV_SERVER_URL
       ? path.join(__dirname, '../../serial_port.ico')
       : path.join(__dirname, '../dist/serial_port.ico'),
@@ -544,8 +572,7 @@ const GENERATORS: Record<string, () => string | string[]> = {
     return `@IIHFB,${val1.toFixed(1)},M,${val2.toFixed(1)},M\r\n`
   },
   '@IIMTW': () => {
-    const val = Math.random() * 6.5 + 2.0
-    return `@IIMTW,${val.toFixed(1)},C\r\n`
+    return `@IIMTW,${state.vessel.water_temp.toFixed(1)},C\r\n`
   },
   '@IITDS': () => {
     const val = Math.random() * 35 + 40
@@ -611,15 +638,18 @@ const GENERATORS: Record<string, () => string | string[]> = {
     return `$${body}*${generateChecksum(body)}\r\n`
   },
   '$SDMTW': () => {
-    const val = Math.random() * 6 + 9.0
-    const body = `SDMTW,${val.toFixed(1)},C`
+    const body = `SDMTW,${state.vessel.water_temp.toFixed(1)},C`
+    return `$${body}*${generateChecksum(body)}\r\n`
+  },
+  '$YCMTW': () => {
+    const body = `YCMTW,${state.vessel.water_temp.toFixed(1)},C`
     return `$${body}*${generateChecksum(body)}\r\n`
   },
   '$WIMWV': () => {
-    const t_dir = Math.random() * 360
-    const t_spd = Math.random() * 20 + 5
-    const r_ang = (t_dir - state.vessel.track + Math.random() * 60 - 30) % 360
-    const r_spd = Math.abs(t_spd + Math.random() * 4 - 2)
+    const t_dir = state.vessel.wind_dir
+    const t_spd = state.vessel.wind_speed
+    const r_ang = state.vessel.wind_dir_relative
+    const r_spd = state.vessel.wind_speed_relative
     const t_body = `WIMWV,${t_dir.toFixed(1)},T,${t_spd.toFixed(1)},N,A`
     const r_body = `WIMWV,${r_ang.toFixed(1)},R,${r_spd.toFixed(1)},N,A`
     return `$${t_body}*${generateChecksum(t_body)}\r\n` + `$${r_body}*${generateChecksum(r_body)}\r\n`
@@ -867,10 +897,53 @@ ipcMain.on('toggle-telemetry-udp', (_event, { mappingId, tcpPort, udpIp, udpPort
 // --- TAB 3: LOCAL VESSEL SIMULATION CORE ---
 ipcMain.on('update-vessel-speed', (_event, speed) => {
   state.vessel.default_speed = parseFloat(speed)
+  const config = loadConfigData()
+  config.vessel_speed = speed.toString()
+  saveConfigData(config)
+})
+
+ipcMain.on('update-wind-speed', (_event, speed) => {
+  state.vessel.wind_speed_set = parseFloat(speed)
+  const config = loadConfigData()
+  config.vessel_wind_speed_set = speed.toString()
+  saveConfigData(config)
+})
+
+ipcMain.on('update-wind-dir', (_event, dir) => {
+  state.vessel.wind_dir_set = parseFloat(dir)
+  const config = loadConfigData()
+  config.vessel_wind_dir_set = dir.toString()
+  saveConfigData(config)
+})
+
+ipcMain.on('update-depth-set', (_event, depth) => {
+  state.vessel.depth_set = parseFloat(depth)
+  const config = loadConfigData()
+  config.vessel_depth_set = depth.toString()
+  saveConfigData(config)
+})
+
+ipcMain.on('update-temp-set', (_event, temp) => {
+  state.vessel.temp_set = parseFloat(temp)
+  const config = loadConfigData()
+  config.vessel_temp_set = temp.toString()
+  saveConfigData(config)
 })
 
 ipcMain.on('toggle-vessel-breadcrumbs', (_event, enabled) => {
   state.vessel.breadcrumb_enabled = enabled
+})
+
+ipcMain.on('steer-left', () => {
+  state.vessel.track = (state.vessel.track - 5 + 360) % 360
+  state.vessel.heading = state.vessel.track
+  logMessage(`[VesselSim] Steered 5° LEFT. New heading: ${state.vessel.track.toFixed(1)}°`)
+})
+
+ipcMain.on('steer-right', () => {
+  state.vessel.track = (state.vessel.track + 5) % 360
+  state.vessel.heading = state.vessel.track
+  logMessage(`[VesselSim] Steered 5° RIGHT. New heading: ${state.vessel.track.toFixed(1)}°`)
 })
 
 ipcMain.on('update-vessel-coords', (_event, { lat, lon }) => {
@@ -914,14 +987,35 @@ ipcMain.on('start-vessel-sim', () => {
     }
 
     const [nLat, nLon] = calculate_destination(state.vessel.lat, state.vessel.lon, track, metersPerSec * 0.1)
-    const depth = Math.floor(Math.random() * 270 + 180)
+
+    // Wander +/- 10% around base values
+    const activeWindSpd = state.vessel.wind_speed_set * (Math.random() * 0.2 + 0.9)
+    const activeWindDir = (state.vessel.wind_dir_set + (Math.random() * 10 - 5) + 360) % 360
+    const activeDepth = state.vessel.depth_set * (Math.random() * 0.2 + 0.9)
+    const activeTemp = state.vessel.temp_set * (Math.random() * 0.2 + 0.9)
+
+    // Apparent wind vector math:
+    const thetaTrueRel = (activeWindDir - track + 360) % 360
+    const thetaTrueRelRad = (thetaTrueRel * Math.PI) / 180
+
+    const xRel = activeWindSpd * Math.sin(thetaTrueRelRad)
+    const yRel = activeWindSpd * Math.cos(thetaTrueRelRad) + speedKts
+
+    const activeWindSpdRel = Math.sqrt(xRel * xRel + yRel * yRel)
+    const activeWindDirRel = (Math.atan2(xRel, yRel) * 180 / Math.PI + 360) % 360
 
     state.vessel.lat = nLat
     state.vessel.lon = nLon
     state.vessel.sog_knots = speedKts
     state.vessel.track = track
     state.vessel.heading = track
-    state.vessel.seafloor_depth = depth
+    state.vessel.seafloor_depth = parseFloat(activeDepth.toFixed(1))
+    state.vessel.water_temp = parseFloat(activeTemp.toFixed(1))
+    state.vessel.wind_speed = parseFloat(activeWindSpd.toFixed(1))
+    state.vessel.wind_dir = parseFloat(activeWindDir.toFixed(1))
+    state.vessel.wind_speed_relative = parseFloat(activeWindSpdRel.toFixed(1))
+    state.vessel.wind_dir_relative = parseFloat(activeWindDirRel.toFixed(1))
+
     state.vessel.pitch = Math.random() * 4 - 2
     state.vessel.roll = Math.random() * 8 - 4
     state.vessel.heave = Math.random() * 1 - 0.5
@@ -959,7 +1053,17 @@ ipcMain.on('start-vessel-sim', () => {
           sweptArea: state.vessel.area_swept_kpi,
           heading: state.vessel.heading,
           trackHistory: state.track_history,
-          breadcrumbEnabled: state.vessel.breadcrumb_enabled
+          breadcrumbEnabled: state.vessel.breadcrumb_enabled,
+          // Extra values
+          waterTemp: state.vessel.water_temp,
+          windSpeedSet: state.vessel.wind_speed_set,
+          windDirSet: state.vessel.wind_dir_set,
+          depthSet: state.vessel.depth_set,
+          tempSet: state.vessel.temp_set,
+          windSpeedActive: state.vessel.wind_speed,
+          windDirActive: state.vessel.wind_dir,
+          windSpeedRelative: state.vessel.wind_speed_relative,
+          windDirRelative: state.vessel.wind_dir_relative
         })
       }
     }
@@ -985,7 +1089,17 @@ ipcMain.on('stop-vessel-sim', () => {
       sweptArea: state.vessel.area_swept_kpi,
       heading: state.vessel.heading,
       trackHistory: state.track_history,
-      breadcrumbEnabled: state.vessel.breadcrumb_enabled
+      breadcrumbEnabled: state.vessel.breadcrumb_enabled,
+      // Extra values
+      waterTemp: state.vessel.water_temp,
+      windSpeedSet: state.vessel.wind_speed_set,
+      windDirSet: state.vessel.wind_dir_set,
+      depthSet: state.vessel.depth_set,
+      tempSet: state.vessel.temp_set,
+      windSpeedActive: state.vessel.wind_speed,
+      windDirActive: state.vessel.wind_dir,
+      windSpeedRelative: state.vessel.wind_speed_relative,
+      windDirRelative: state.vessel.wind_dir_relative
     })
   }
 })
@@ -1157,25 +1271,36 @@ ipcMain.handle('export-diag-logs', async (_event, { summary, details }) => {
   }
 })
 
+function getMapsPaths() {
+  const baseDir = app.getAppPath()
+  const exeDir = path.dirname(app.getPath('exe'))
+
+  const candidates = [
+    path.join(baseDir, '../data/maps'),               // Dev mode root
+    path.join(exeDir, '../../data/maps'),             // Packaged in dist-build/win-unpacked
+    path.join(exeDir, 'data/maps'),                   // Packaged sibling to EXE
+    path.join(process.resourcesPath, 'data/maps')     // Standard resources path
+  ]
+
+  for (const c of candidates) {
+    const dbPath = path.join(c, 'esri_ocean_1_12.mbtiles')
+    const scriptPath = path.join(c, 'get_tile.py')
+    if (fs.existsSync(dbPath) && fs.existsSync(scriptPath)) {
+      return { dbPath, scriptPath }
+    }
+  }
+  return null
+}
+
 ipcMain.handle('get-tile', async (_event, { z, x, y }) => {
   return new Promise((resolve) => {
-    const baseDir = app.getAppPath()
-    const dbPath = path.isAbsolute(baseDir)
-      ? path.join(baseDir, '../data/maps/esri_ocean_1_12.mbtiles')
-      : path.resolve(path.join(baseDir, '../data/maps/esri_ocean_1_12.mbtiles'))
-    const scriptPath = path.isAbsolute(baseDir)
-      ? path.join(baseDir, '../data/maps/get_tile.py')
-      : path.resolve(path.join(baseDir, '../data/maps/get_tile.py'))
-
-    if (!fs.existsSync(dbPath)) {
-      logMessage(`[MapTiles] Error: Database not found at ${dbPath}`)
-      return resolve(null)
-    }
-    if (!fs.existsSync(scriptPath)) {
-      logMessage(`[MapTiles] Error: Python script not found at ${scriptPath}`)
+    const paths = getMapsPaths()
+    if (!paths) {
+      logMessage(`[MapTiles] Error: Map assets (mbtiles / script) not found in candidates list.`)
       return resolve(null)
     }
 
+    const { dbPath, scriptPath } = paths
     const pythonCmd = process.platform === 'win32' ? 'python' : 'python3'
 
     const child = child_process.spawn(pythonCmd, [scriptPath, dbPath, z.toString(), x.toString(), y.toString()], {

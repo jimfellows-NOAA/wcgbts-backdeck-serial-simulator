@@ -44,10 +44,6 @@ export default function App() {
             NWFSC VESSEL SIMULATOR
           </h1>
         </div>
-        <div className="flex items-center gap-2 px-2.5 py-1 bg-emerald-950/50 border border-emerald-800/60 rounded-full text-xs text-emerald-400 font-semibold shadow-inner">
-          <ShieldCheck className="w-3.5 h-3.5" />
-          YOLO MODE
-        </div>
       </header>
 
       {/* --- TABBED NAVIGATION --- */}

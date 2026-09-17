@@ -31,7 +31,8 @@
     "appId": "com.wcgbts.backdeck-serial-simulator",
     "productName": "NWFSC Vessel Simulator",
     "win": {
-      "target": "portable"
+      "target": "zip",
+      "icon": "public/serial_port.ico"
     },
     "files": [
       "dist/**/*",

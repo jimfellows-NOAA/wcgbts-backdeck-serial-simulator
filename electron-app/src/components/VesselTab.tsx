@@ -5,7 +5,7 @@ const DEVICE_GROUPS: Record<string, string[]> = {
   "GPS": ["$GPGLL", "$GPHDT", "$GPRMC", "$GPVTG"],
   "ITI_Trawl_System": ["$IIDBS", "$IIGLL", "@IIHFB", "@IIMTW", "@IITDS", "@IITPT"],
   "Furuno_Attitude_Heave": ["$PFEC,GPatt", "$PFEC,GPhve"],
-  "Echosounder_Depth_Temp": ["$SDDBS", "$SDDBT", "$SDDPT", "$SDMTW"],
+  "Echosounder_Depth_Temp": ["$SDDBS", "$SDDBT", "$SDDPT", "$SDMTW", "$YCMTW"],
   "$PSIMP,D1": ["$PSIMP,D1"],
   "$PSIMTV80": ["$PSIMTV80"],
   "$WIMWV": ["$WIMWV"]
@@ -33,6 +33,16 @@ interface VesselState {
   heading: number
   trackHistory: Array<[number, number, number]>
   breadcrumbEnabled: boolean
+  // New variables
+  waterTemp?: number
+  windSpeedSet?: number
+  windDirSet?: number
+  depthSet?: number
+  tempSet?: number
+  windSpeedActive?: number
+  windDirActive?: number
+  windSpeedRelative?: number
+  windDirRelative?: number
 }
 
 export default function VesselTab() {
@@ -52,7 +62,135 @@ export default function VesselTab() {
   })
 
   const [speedVal, setSpeedVal] = useState(10.0)
+  const [windSpeedVal, setWindSpeedVal] = useState(5.0)
+  const [windDirVal, setWindDirVal] = useState(240.0)
+  const [depthVal, setDepthVal] = useState(300.0)
+  const [tempVal, setTempVal] = useState(12.0)
   const [mapZoom, setMapZoom] = useState(5000.0) // pixels per degree
+
+  const [averages, setAverages] = useState({
+    hdg: 0.0,
+    sog: 0.0,
+    tws: 5.0,
+    twd: 240.0,
+    rws: 5.0,
+    rwd: 240.0,
+    dep: 300.0,
+    tmp: 12.0
+  })
+
+  const averageHistoryRef = useRef<Array<{
+    hdg: number;
+    sog: number;
+    tws: number;
+    twd: number;
+    rws: number;
+    rwd: number;
+    dep: number;
+    tmp: number;
+    timestamp: number;
+  }>>([])
+
+  // Collect 1Hz samples for 5-minute rolling averages
+  useEffect(() => {
+    if (vessel.mode === 'Idle') {
+      averageHistoryRef.current = []
+      return
+    }
+    const interval = setInterval(() => {
+      const now = Date.now()
+      const sample = {
+        hdg: vessel.heading ?? 0.0,
+        sog: vessel.speed ?? 0.0,
+        tws: vessel.windSpeedActive ?? 5.0,
+        twd: vessel.windDirActive ?? 240.0,
+        rws: vessel.windSpeedRelative ?? 5.0,
+        rwd: vessel.windDirRelative ?? 240.0,
+        dep: vessel.depth ?? 300.0,
+        tmp: vessel.waterTemp ?? 12.0,
+        timestamp: now
+      }
+      averageHistoryRef.current.push(sample)
+      
+      // Clean up samples older than 5 minutes (300,000 ms)
+      const cutoff = now - 5 * 60 * 1000
+      averageHistoryRef.current = averageHistoryRef.current.filter(s => s.timestamp >= cutoff)
+      
+      const history = averageHistoryRef.current
+      if (history.length > 0) {
+        // Calculate averages
+        const arithmeticAvg = (key: 'sog' | 'tws' | 'rws' | 'dep' | 'tmp') => {
+          return history.reduce((sum, s) => sum + s[key], 0) / history.length
+        }
+        
+        const circularAvg = (key: 'hdg' | 'twd' | 'rwd') => {
+          let sinSum = 0
+          let cosSum = 0
+          for (const s of history) {
+            const rad = (s[key] * Math.PI) / 180
+            sinSum += Math.sin(rad)
+            cosSum += Math.cos(rad)
+          }
+          return (Math.atan2(sinSum, cosSum) * 180 / Math.PI + 360) % 360
+        }
+        
+        setAverages({
+          hdg: circularAvg('hdg'),
+          sog: arithmeticAvg('sog'),
+          tws: arithmeticAvg('tws'),
+          twd: circularAvg('twd'),
+          rws: arithmeticAvg('rws'),
+          rwd: circularAvg('rwd'),
+          dep: arithmeticAvg('dep'),
+          tmp: arithmeticAvg('tmp')
+        })
+      }
+    }, 1000)
+    
+    return () => clearInterval(interval)
+  }, [
+    vessel.mode,
+    vessel.heading,
+    vessel.speed,
+    vessel.windSpeedActive,
+    vessel.windDirActive,
+    vessel.windSpeedRelative,
+    vessel.windDirRelative,
+    vessel.depth,
+    vessel.waterTemp
+  ])
+
+  // Bind native non-passive wheel zoom listener to prevent React passive warnings
+  const mapZoomRef = useRef(mapZoom)
+  useEffect(() => {
+    mapZoomRef.current = mapZoom
+  }, [mapZoom])
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const delta = -e.deltaY
+      const zoomFactor = delta > 0 ? 1.15 : 0.85
+      handleZoomChange(mapZoomRef.current * zoomFactor)
+    }
+
+    canvas.addEventListener('wheel', handleWheel, { passive: false })
+    return () => {
+      canvas.removeEventListener('wheel', handleWheel)
+    }
+  }, [])
+
+  // Trigger map canvas redraw on window resize to prevent stretching/distortion
+  useEffect(() => {
+    const handleResize = () => {
+      setRedrawTrigger((prev) => prev + 1)
+    }
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
 
   // Ports lists state
   const [broadcastPorts, setBroadcastPorts] = useState<BroadcastPort[]>([])
@@ -94,10 +232,39 @@ export default function VesselTab() {
     // Load config
     window.electronAPI.loadConfig().then((config) => {
       if (config.vessel_speed) {
-        setSpeedVal(config.vessel_speed)
-        window.electronAPI.updateVesselSpeed(config.vessel_speed)
+        const val = parseFloat(config.vessel_speed)
+        const safeVal = isNaN(val) ? 10.0 : val
+        setSpeedVal(safeVal)
+        window.electronAPI.updateVesselSpeed(safeVal)
       }
-      if (config.vessel_zoom) setMapZoom(config.vessel_zoom)
+      if (config.vessel_wind_speed_set) {
+        const val = parseFloat(config.vessel_wind_speed_set)
+        const safeVal = isNaN(val) ? 5.0 : val
+        setWindSpeedVal(safeVal)
+        window.electronAPI.updateWindSpeed(safeVal)
+      }
+      if (config.vessel_wind_dir_set) {
+        const val = parseFloat(config.vessel_wind_dir_set)
+        const safeVal = isNaN(val) ? 240.0 : val
+        setWindDirVal(safeVal)
+        window.electronAPI.updateWindDir(safeVal)
+      }
+      if (config.vessel_depth_set) {
+        const val = parseFloat(config.vessel_depth_set)
+        const safeVal = isNaN(val) ? 300.0 : val
+        setDepthVal(safeVal)
+        window.electronAPI.updateDepthSet(safeVal)
+      }
+      if (config.vessel_temp_set) {
+        const val = parseFloat(config.vessel_temp_set)
+        const safeVal = isNaN(val) ? 12.0 : val
+        setTempVal(safeVal)
+        window.electronAPI.updateTempSet(safeVal)
+      }
+      if (config.vessel_zoom) {
+        const val = parseFloat(config.vessel_zoom)
+        setMapZoom(isNaN(val) ? 5000.0 : val)
+      }
       if (config.vessel_ports) {
         // Sanitize legacy port records dynamically on mount
         const sanitized = config.vessel_ports.map((p: any) => {
@@ -120,7 +287,7 @@ export default function VesselTab() {
 
     // Listen to 1Hz state updates
     const unsubscribeState = window.electronAPI.onVesselState((newState) => {
-      setVessel(newState)
+      setVessel((prev) => ({ ...prev, ...newState }))
     })
 
     // Listen to NMEA sentences stream from active runners and prepend protocol indicator
@@ -187,11 +354,23 @@ export default function VesselTab() {
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
+
+    // Get client layout dimensions
+    const dpr = window.devicePixelRatio || 1
+    const rect = canvas.getBoundingClientRect()
+    
+    // Scale logical canvas size to layout size * dpr (prevents ANY blurriness or distortion!)
+    canvas.width = rect.width * dpr
+    canvas.height = rect.height * dpr
+
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
-    const width = canvas.width
-    const height = canvas.height
+    // Scale context drawing by devicePixelRatio
+    ctx.scale(dpr, dpr)
+
+    const width = rect.width
+    const height = rect.height
     
     // Default background color mimicking ocean bathymetry before tiles load
     ctx.fillStyle = '#0c1524'
@@ -340,7 +519,139 @@ export default function VesselTab() {
     ctx.stroke()
     ctx.restore()
 
-  }, [vessel, mapZoom, redrawTrigger])
+    // 6. Draw Nautical Instruments Panel in Top-Right Corner (Streamlined circular compass face)
+    if (width > 120 && height > 120) {
+      const dx = width - 60
+      const dy = 68
+      const r = 34
+
+      // Draw semi-transparent background box for the compass with rounded corners and slight opacity (70%)
+      ctx.fillStyle = "rgba(6, 16, 30, 0.70)"
+      ctx.strokeStyle = "#1c2d3d"
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      ctx.roundRect(width - 110, 10, 100, 100, 8)
+      ctx.fill()
+      ctx.stroke()
+
+      // Header title text
+      ctx.fillStyle = "#5a7a8a"
+      ctx.font = "bold 6.5px Arial"
+      ctx.textAlign = "center"
+      ctx.textBaseline = "middle"
+      ctx.fillText("WIND & VESSEL BEARING", width - 60, 21)
+
+      // Compass Circle
+      ctx.strokeStyle = "#324a5e"
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      ctx.arc(dx, dy, r, 0, 2 * Math.PI)
+      ctx.stroke()
+
+      // Cardinal directions (scaled for r = 34)
+      ctx.fillStyle = "#ffffff"
+      ctx.font = "bold 7px Arial"
+      ctx.textBaseline = "middle"
+      ctx.textAlign = "center"
+      ctx.fillText("N", dx, dy - r + 7)
+      ctx.fillText("S", dx, dy + r - 7)
+      ctx.fillText("E", dx + r - 7, dy)
+      ctx.fillText("W", dx - r + 7, dy)
+
+      // Draw Vessel Icon in the center (representing its heading)
+      ctx.save()
+      ctx.translate(dx, dy)
+      ctx.rotate((vessel.heading * Math.PI) / 180)
+      ctx.fillStyle = '#ff4500' // orange-red
+      ctx.strokeStyle = '#ffffff'
+      ctx.lineWidth = 1
+      ctx.beginPath()
+      ctx.moveTo(0, -7)
+      ctx.lineTo(-3, 4)
+      ctx.lineTo(0, 1)
+      ctx.lineTo(3, 4)
+      ctx.closePath()
+      ctx.fill()
+      ctx.stroke()
+      ctx.restore()
+
+      // Get wind directions
+      const twDir = vessel.windDirActive ?? 240.0
+      const rwDir = vessel.windDirRelative ?? 240.0
+
+      // Draw True Wind Indicator (Green Arrow pointing towards center)
+      const radTw = twDir * Math.PI / 180
+      const twXStart = dx + (r - 2) * Math.sin(radTw)
+      const twYStart = dy - (r - 2) * Math.cos(radTw)
+      const twXEnd = dx + (r - 11) * Math.sin(radTw)
+      const twYEnd = dy - (r - 11) * Math.cos(radTw)
+
+      ctx.strokeStyle = "#00ff66"
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      ctx.moveTo(twXStart, twYStart)
+      ctx.lineTo(twXEnd, twYEnd)
+      ctx.stroke()
+
+      // Draw Arrow Head for True Wind
+      ctx.save()
+      ctx.translate(twXEnd, twYEnd)
+      ctx.rotate(radTw)
+      ctx.fillStyle = "#00ff66"
+      ctx.beginPath()
+      ctx.moveTo(0, 0)
+      ctx.lineTo(-2.5, 5)
+      ctx.lineTo(2.5, 5)
+      ctx.closePath()
+      ctx.fill()
+      ctx.restore()
+
+      // Label 'T' next to start
+      const twLblX = dx + (r + 6) * Math.sin(radTw)
+      const twLblY = dy - (r + 6) * Math.cos(radTw)
+      ctx.fillStyle = "#00ff66"
+      ctx.font = "bold 7px Arial"
+      ctx.fillText("T", twLblX, twLblY)
+
+      // Draw Relative Wind Indicator (Orange Arrow pointing towards center)
+      const absRwDir = (vessel.heading + rwDir) % 360
+      const radRw = absRwDir * Math.PI / 180
+      const rwXStart = dx + (r - 2) * Math.sin(radRw)
+      const rwYStart = dy - (r - 2) * Math.cos(radRw)
+      const rwXEnd = dx + (r - 11) * Math.sin(radRw)
+      const rwYEnd = dy - (r - 11) * Math.cos(radRw)
+
+      ctx.strokeStyle = "#ff9900"
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([2, 2])
+      ctx.beginPath()
+      ctx.moveTo(rwXStart, rwYStart)
+      ctx.lineTo(rwXEnd, rwYEnd)
+      ctx.stroke()
+      ctx.setLineDash([])
+
+      // Draw Arrow Head for Relative Wind
+      ctx.save()
+      ctx.translate(rwXEnd, rwYEnd)
+      ctx.rotate(radRw)
+      ctx.fillStyle = "#ff9900"
+      ctx.beginPath()
+      ctx.moveTo(0, 0)
+      ctx.lineTo(-2, 4)
+      ctx.lineTo(2, 4)
+      ctx.closePath()
+      ctx.fill()
+      ctx.restore()
+
+      // Label 'R' next to start
+      const rwLblX = dx + (r + 6) * Math.sin(radRw)
+      const rwLblY = dy - (r + 6) * Math.cos(radRw)
+      ctx.fillStyle = "#ff9900"
+      ctx.font = "bold 7px Arial"
+      ctx.fillText("R", rwLblX, rwLblY)
+    }
+
+  }, [vessel, mapZoom, averages, redrawTrigger])
 
   useEffect(() => {
     if (nmeaLogRef.current) nmeaLogRef.current.scrollTop = nmeaLogRef.current.scrollHeight
@@ -356,8 +667,36 @@ export default function VesselTab() {
     window.electronAPI.saveConfig('vessel_speed', val)
   }
 
+  const handleWindSpeedChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value)
+    setWindSpeedVal(val)
+    window.electronAPI.updateWindSpeed(val)
+    window.electronAPI.saveConfig('vessel_wind_speed_set', val)
+  }
+
+  const handleWindDirChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value)
+    setWindDirVal(val)
+    window.electronAPI.updateWindDir(val)
+    window.electronAPI.saveConfig('vessel_wind_dir_set', val)
+  }
+
+  const handleDepthChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value)
+    setDepthVal(val)
+    window.electronAPI.updateDepthSet(val)
+    window.electronAPI.saveConfig('vessel_depth_set', val)
+  }
+
+  const handleTempChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value)
+    setTempVal(val)
+    window.electronAPI.updateTempSet(val)
+    window.electronAPI.saveConfig('vessel_temp_set', val)
+  }
+
   const handleZoomChange = (newZoom: number) => {
-    const clamped = Math.max(1000, Math.min(30000, newZoom))
+    const clamped = Math.max(100, Math.min(30000, newZoom))
     setMapZoom(clamped)
     window.electronAPI.saveConfig('vessel_zoom', clamped)
   }
@@ -487,7 +826,7 @@ export default function VesselTab() {
         </button>
 
         {/* Speed Adjustment */}
-        <div className="flex items-center gap-2 flex-grow max-w-xs">
+        <div className="flex items-center gap-2 flex-grow max-w-[340px]">
           <span className="text-xs text-gray-400 font-semibold shrink-0">Speed:</span>
           <input
             type="range"
@@ -499,6 +838,24 @@ export default function VesselTab() {
             className="flex-grow accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
           />
           <span className="text-xs font-mono font-bold text-orange-400 w-12 text-right">{speedVal.toFixed(1)} kts</span>
+          
+          {/* Steering Buttons */}
+          <div className="flex items-center gap-0.5 ml-1 shrink-0">
+            <button
+              onClick={() => window.electronAPI.steerLeft()}
+              title="Steer Left"
+              className="px-1.5 py-0.5 bg-gray-800 hover:bg-gray-750 text-gray-300 hover:text-orange-400 border border-gray-700/60 rounded text-[10px] font-bold active:scale-95 transition cursor-pointer"
+            >
+              ◀
+            </button>
+            <button
+              onClick={() => window.electronAPI.steerRight()}
+              title="Steer Right"
+              className="px-1.5 py-0.5 bg-gray-800 hover:bg-gray-750 text-gray-300 hover:text-orange-400 border border-gray-700/60 rounded text-[10px] font-bold active:scale-95 transition cursor-pointer"
+            >
+              ▶
+            </button>
+          </div>
         </div>
 
         {/* Map Zoom Slider */}
@@ -506,9 +863,9 @@ export default function VesselTab() {
           <span className="text-xs text-gray-400 font-semibold shrink-0">Zoom:</span>
           <input
             type="range"
-            min="1000"
+            min="100"
             max="30000"
-            step="500"
+            step="100"
             value={mapZoom}
             onChange={handleZoomSliderChange}
             className="flex-grow accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
@@ -537,26 +894,117 @@ export default function VesselTab() {
             Status: {vessel.mode}
           </div>
 
-          <div className="flex-grow flex flex-col justify-center font-mono text-xs text-gray-300 gap-2 px-2 max-h-36">
-            <div className="flex justify-between border-b border-gray-800/40 pb-1">
+          <div className="flex-grow flex flex-col justify-center font-mono text-[10px] text-gray-300 gap-1 px-1 overflow-y-auto max-h-56 shrink-0 border border-gray-800 p-2 rounded bg-gray-950/40">
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
               <span>Latitude:</span>
               <span className="text-gray-100 font-bold">{vessel.lat.toFixed(6)}° N</span>
             </div>
-            <div className="flex justify-between border-b border-gray-800/40 pb-1">
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
               <span>Longitude:</span>
               <span className="text-gray-100 font-bold">{vessel.lon.toFixed(6)}° W</span>
             </div>
-            <div className="flex justify-between border-b border-gray-800/40 pb-1">
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
               <span>Vess Speed:</span>
-              <span className="text-gray-100 font-bold">{vessel.speed.toFixed(2)} knots</span>
+              <span className="text-gray-100 font-bold">{vessel.speed.toFixed(2)} kts</span>
             </div>
-            <div className="flex justify-between border-b border-gray-800/40 pb-1">
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
+              <span>Heading:</span>
+              <span className="text-gray-100 font-bold">{vessel.heading.toFixed(1)}°</span>
+            </div>
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
               <span>Floor Depth:</span>
-              <span className="text-gray-100 font-bold">{vessel.depth} meters</span>
+              <span className="text-gray-100 font-bold">{vessel.depth.toFixed(1)} m</span>
+            </div>
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
+              <span>Water Temp:</span>
+              <span className="text-gray-100 font-bold">{(vessel.waterTemp ?? 12.0).toFixed(1)} °C</span>
+            </div>
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
+              <span>True Wind:</span>
+              <span className="text-gray-100 font-bold">{(vessel.windSpeedActive ?? 5.0).toFixed(1)} kts @ {(vessel.windDirActive ?? 240.0).toFixed(1)}°</span>
+            </div>
+            <div className="flex justify-between border-b border-gray-800/40 pb-0.5">
+              <span>Rel Wind:</span>
+              <span className="text-gray-100 font-bold">{(vessel.windSpeedRelative ?? 5.0).toFixed(1)} kts @ {(vessel.windDirRelative ?? 240.0).toFixed(1)}°</span>
             </div>
             <div className="flex justify-between">
               <span>Area Swept:</span>
               <span className="text-emerald-400 font-bold">{vessel.sweptArea.toFixed(2)} ha</span>
+            </div>
+          </div>
+
+          {/* Environmental Setpoints Box */}
+          <div className="mt-3 bg-gray-900/50 p-2.5 rounded-lg border border-gray-800 flex flex-col gap-2 shrink-0">
+            <h5 className="text-[10px] font-bold text-gray-400 uppercase tracking-wider border-b border-gray-800 pb-1">
+              Environmental Setpoints
+            </h5>
+            
+            {/* Wind Speed */}
+            <div className="flex flex-col gap-0.5">
+              <div className="flex justify-between text-[9px] font-bold text-gray-500 uppercase">
+                <span>Wind Speed</span>
+                <span className="text-orange-400 font-mono font-bold">{windSpeedVal.toFixed(1)} kts</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="50"
+                step="0.1"
+                value={windSpeedVal}
+                onChange={handleWindSpeedChange}
+                className="w-full accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
+              />
+            </div>
+
+            {/* Wind Dir */}
+            <div className="flex flex-col gap-0.5">
+              <div className="flex justify-between text-[9px] font-bold text-gray-500 uppercase">
+                <span>Wind Direction</span>
+                <span className="text-orange-400 font-mono font-bold">{windDirVal.toFixed(0)}°</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="359.9"
+                step="1"
+                value={windDirVal}
+                onChange={handleWindDirChange}
+                className="w-full accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
+              />
+            </div>
+
+            {/* Depth setpoint */}
+            <div className="flex flex-col gap-0.5">
+              <div className="flex justify-between text-[9px] font-bold text-gray-500 uppercase">
+                <span>Sim Seafloor Depth</span>
+                <span className="text-orange-400 font-mono font-bold">{depthVal.toFixed(0)} m</span>
+              </div>
+              <input
+                type="range"
+                min="10"
+                max="1000"
+                step="1"
+                value={depthVal}
+                onChange={handleDepthChange}
+                className="w-full accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
+              />
+            </div>
+
+            {/* Temp setpoint */}
+            <div className="flex flex-col gap-0.5">
+              <div className="flex justify-between text-[9px] font-bold text-gray-500 uppercase">
+                <span>Water Temperature</span>
+                <span className="text-orange-400 font-mono font-bold">{tempVal.toFixed(1)} °C</span>
+              </div>
+              <input
+                type="range"
+                min="-2"
+                max="40"
+                step="0.1"
+                value={tempVal}
+                onChange={handleTempChange}
+                className="w-full accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
+              />
             </div>
           </div>
 
@@ -635,9 +1083,6 @@ export default function VesselTab() {
 
         {/* COLUMN 2: Native GIS Map Canvas */}
         <div className="col-span-4 border border-gray-800/60 bg-gray-950 rounded-lg overflow-hidden flex flex-col relative">
-          <h4 className="text-[10px] font-bold text-gray-500 tracking-wider absolute top-2 left-2 z-10 px-1.5 py-0.5 bg-gray-950/80 rounded border border-gray-800">
-            NATIVE GIS CANVAS TRACKER
-          </h4>
           <canvas
             ref={canvasRef}
             width={320}
