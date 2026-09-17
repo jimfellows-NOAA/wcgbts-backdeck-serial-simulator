@@ -49,6 +49,30 @@ export interface IElectronAPI {
   mapDrive: (driveLetter: string, targetIp: string) => Promise<{ success: boolean, output: string }>;
   runDriveSpeedTest: (path: string, sizeMb: number) => Promise<{ success: boolean, speedMbSec: number, duration: number, msg: string }>;
   exportDiagLogs: (summary: string, details: string) => Promise<{ success: boolean, msg: string }>;
+
+  // Tab 6: Sampling Camera Simulator
+  getCameraStatus: () => Promise<{
+    active: boolean;
+    port: number;
+    host: string;
+    logs: string[];
+    state: {
+      species: string;
+      angler_position: string;
+      drop_number: string;
+      hook_number: string;
+      site_number: string;
+      is_recording: boolean;
+      video_quality: string;
+      video_resolution: string;
+      vflip: boolean;
+      hflip: boolean;
+      temperature: number;
+    }
+  }>;
+  startCameraServer: (host: string, port: number) => Promise<{ success: boolean; msg: string }>;
+  stopCameraServer: () => Promise<boolean>;
+  onCameraLog: (callback: (log: string) => void) => () => void;
 }
 
 declare global {

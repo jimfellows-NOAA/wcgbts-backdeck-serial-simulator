@@ -89,5 +89,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   runPing: (targetIp: string) => ipcRenderer.invoke('run-ping', targetIp),
   mapDrive: (driveLetter: string, targetIp: string) => ipcRenderer.invoke('map-drive', { driveLetter, targetIp }),
   runDriveSpeedTest: (path: string, sizeMb: number) => ipcRenderer.invoke('run-drive-speed-test', { path, sizeMb }),
-  exportDiagLogs: (summary: string, details: string) => ipcRenderer.invoke('export-diag-logs', { summary, details })
+  exportDiagLogs: (summary: string, details: string) => ipcRenderer.invoke('export-diag-logs', { summary, details }),
+
+  // Tab 6: Sampling Camera Simulator
+  getCameraStatus: () => ipcRenderer.invoke('get-camera-status'),
+  startCameraServer: (host: string, port: number) => ipcRenderer.invoke('start-camera-server', { host, port }),
+  stopCameraServer: () => ipcRenderer.invoke('stop-camera-server'),
+  onCameraLog: (callback: (log: string) => void) => {
+    const listener = (_event: any, log: string) => callback(log)
+    ipcRenderer.on('camera-log', listener)
+    return () => ipcRenderer.removeListener('camera-log', listener)
+  }
 })

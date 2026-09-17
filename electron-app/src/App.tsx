@@ -3,10 +3,11 @@ import DevicesTab from './components/DevicesTab'
 import TelemetryTab from './components/TelemetryTab'
 import VesselTab from './components/VesselTab'
 import NetworkTab from './components/NetworkTab'
+import SamplingCameraTab from './components/SamplingCameraTab'
 import { Terminal, ShieldCheck, Cpu } from 'lucide-react'
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'devices' | 'telemetry' | 'vessel' | 'network'>('vessel')
+  const [activeTab, setActiveTab] = useState<'devices' | 'telemetry' | 'vessel' | 'network' | 'camera'>('vessel')
   const [logs, setLogs] = useState<string[]>([])
   const logContainerRef = useRef<HTMLDivElement>(null)
 
@@ -88,6 +89,16 @@ export default function App() {
         >
           Telemetry Forwarding
         </button>
+        <button
+          onClick={() => setActiveTab('camera')}
+          className={`px-5 py-2.5 border-b-2 transition-all ${
+            activeTab === 'camera'
+              ? 'border-orange-500 text-orange-400 bg-orange-500/5 font-semibold'
+              : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/30'
+          }`}
+        >
+          Sampling Camera
+        </button>
       </nav>
 
       {/* --- ACTIVE TAB ELEMENT PANEL --- */}
@@ -97,6 +108,7 @@ export default function App() {
           {activeTab === 'telemetry' && <TelemetryTab />}
           {activeTab === 'vessel' && <VesselTab />}
           {activeTab === 'network' && <NetworkTab />}
+          {activeTab === 'camera' && <SamplingCameraTab />}
         </div>
       </main>
 

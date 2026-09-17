@@ -6,6 +6,7 @@ import dgram from 'node:dgram'
 import dns from 'node:dns'
 import child_process from 'node:child_process'
 import os from 'node:os'
+import http from 'node:http'
 
 // --- JSON Configuration Storage ---
 const configPath = path.join(app.getPath('userData'), 'vessel_simulator_config.json')
@@ -1331,4 +1332,610 @@ ipcMain.handle('get-tile', async (_event, { z, x, y }) => {
       }
     })
   })
+})
+
+// ============================================================================
+// --- TAB 6: SIMULATED CUTTER CAMERA (SAMPLING CAMERA) SERVER & RENDERER ---
+// ============================================================================
+
+let cameraServer: http.Server | null = null
+let cameraOffscreenWindow: BrowserWindow | null = null
+let cameraFrameBuffer: Buffer = Buffer.alloc(0)
+let cameraLogs: string[] = []
+let cameraInterval: NodeJS.Timeout | null = null
+
+const cameraState = {
+  species: 'COWCOD',
+  angler_position: '1',
+  drop_number: '3',
+  hook_number: '2',
+  site_number: '241',
+  is_recording: true,
+  video_quality: 'high',
+  video_resolution: '1280x720',
+  vflip: false,
+  hflip: false,
+  temperature: 34.5,
+  port: 8888,
+  host: '127.0.0.1'
+}
+
+// Load Cowcod reference photo as base64 on boot for offscreen injection
+let cowcodBase64 = ''
+try {
+  const possiblePaths = [
+    path.join(app.getAppPath(), 'public/cowcod_reference.jpeg'),
+    path.join(app.getAppPath(), 'dist/cowcod_reference.jpeg'),
+    path.join(__dirname, '../../public/cowcod_reference.jpeg'),
+    path.join(__dirname, '../public/cowcod_reference.jpeg'),
+    path.join(path.dirname(app.getPath('exe')), 'resources/app.asar/public/cowcod_reference.jpeg'),
+    path.join(path.dirname(app.getPath('exe')), 'cowcod_reference.jpeg')
+  ]
+
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      cowcodBase64 = fs.readFileSync(p).toString('base64')
+      break
+    }
+  }
+} catch (err) {
+  console.error("Failed loading cowcod base64 image asset:", err)
+}
+
+const capturedImagesDir = path.join(app.getPath('userData'), 'captured_images')
+if (!fs.existsSync(capturedImagesDir)) {
+  fs.mkdirSync(capturedImagesDir, { recursive: true })
+}
+
+function logCameraMessage(msg: string) {
+  const timestamp = new Date().toLocaleTimeString()
+  const logStr = `[${timestamp}] ${msg}`
+  cameraLogs.push(logStr)
+  if (cameraLogs.length > 300) {
+    cameraLogs.shift()
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('camera-log', logStr)
+  }
+}
+
+function updateCameraOffscreenContent() {
+  if (!cameraOffscreenWindow) return
+
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body, html {
+          margin: 0; padding: 0; width: 100%; height: 100%;
+          overflow: hidden; background: #000;
+          font-family: Arial, sans-serif;
+        }
+        .container {
+          position: relative; width: 1280px; height: 720px;
+        }
+        .bg-img {
+          width: 100%; height: 100%; object-fit: cover;
+        }
+        .flip-v { transform: scaleY(-1); }
+        .flip-h { transform: scaleX(-1); }
+        .flip-vh { transform: scale(-1, -1); }
+        
+        /* Overlay HUD */
+        .hud-overlay {
+          position: absolute;
+          top: 25px;
+          left: 25px;
+          background: rgba(4, 15, 23, 0.85);
+          color: #10b981; /* emerald-500 */
+          border: 1.5px solid #047857;
+          border-radius: 6px;
+          padding: 12px 16px;
+          font-family: 'Courier New', monospace;
+          font-size: 16px;
+          font-weight: bold;
+          line-height: 1.4;
+          box-shadow: 0 4px 6px rgba(0,0,0,0.4);
+        }
+        .hud-item {
+          display: flex;
+          justify-content: space-between;
+          gap: 20px;
+        }
+        .hud-val {
+          color: #ffffff;
+        }
+        
+        .watermark {
+          position: absolute;
+          bottom: 25px;
+          right: 25px;
+          background: rgba(0,0,0,0.6);
+          color: #94a3b8;
+          padding: 4px 8px;
+          border-radius: 4px;
+          font-size: 11px;
+          font-family: monospace;
+          letter-spacing: 1px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <img class="bg-img ${cameraState.vflip ? (cameraState.hflip ? 'flip-vh' : 'flip-v') : (cameraState.hflip ? 'flip-h' : '')}" src="data:image/jpeg;base64,${cowcodBase64}" />
+        
+        <div class="hud-overlay">
+          <div class="hud-item"><span>SPECIES:</span> <span class="hud-val">${cameraState.species}</span></div>
+          <div class="hud-item"><span>ANGLER:</span> <span class="hud-val">${cameraState.angler_position}</span></div>
+          <div class="hud-item"><span>DROP NUM:</span> <span class="hud-val">${cameraState.drop_number}</span></div>
+          <div class="hud-item"><span>HOOK NUM:</span> <span class="hud-val">${cameraState.hook_number}</span></div>
+          <div class="hud-item"><span>SITE NUM:</span> <span class="hud-val">${cameraState.site_number}</span></div>
+          <div style="border-top: 1.5px solid #047857; margin-top: 6px; padding-top: 6px;" class="hud-item">
+            <span>TEMP:</span> <span class="hud-val">${cameraState.temperature.toFixed(1)}°C</span>
+          </div>
+          <div class="hud-item"><span>TIME:</span> <span class="hud-val">${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC</span></div>
+        </div>
+        
+        <div class="watermark">
+          SIMULATED RPI OVERHEAD CAM (IMX519)
+        </div>
+      </div>
+    </body>
+    </html>
+  `
+  cameraOffscreenWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+}
+
+function startCameraOffscreen() {
+  if (cameraOffscreenWindow) return
+
+  cameraOffscreenWindow = new BrowserWindow({
+    width: 1280,
+    height: 720,
+    show: false,
+    webPreferences: {
+      offscreen: true,
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  })
+
+  updateCameraOffscreenContent()
+
+  // Frame grab loop at 10 FPS
+  cameraInterval = setInterval(() => {
+    if (!cameraOffscreenWindow || !cameraState.is_recording) return
+    cameraOffscreenWindow.webContents.capturePage().then((image) => {
+      cameraFrameBuffer = image.toJPEG(80)
+    }).catch(() => {})
+  }, 100)
+}
+
+function stopCameraOffscreen() {
+  if (cameraInterval) {
+    clearInterval(cameraInterval)
+    cameraInterval = null
+  }
+  if (cameraOffscreenWindow) {
+    cameraOffscreenWindow.destroy()
+    cameraOffscreenWindow = null
+  }
+  cameraFrameBuffer = Buffer.alloc(0)
+}
+
+function zipFiles(filesList: string[], res: http.ServerResponse) {
+  const pythonCode = `
+import os, zipfile, sys
+files = sys.argv[1].split(',')
+sys.stdout.buffer.write(b'')
+with zipfile.ZipFile(sys.stdout.buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+    for f in files:
+        if os.path.exists(f):
+            zipf.write(f, os.path.basename(f))
+  `
+
+  const child = child_process.spawn('python', ['-c', pythonCode, filesList.join(',')], {
+    windowsHide: true
+  })
+
+  res.writeHead(200, {
+    'Content-Type': 'application/zip',
+    'Content-Disposition': 'attachment; filename=cuttercam_images.zip'
+  })
+
+  child.stdout.pipe(res)
+}
+
+function parseJSONBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve) => {
+    let body = ''
+    req.on('data', chunk => body += chunk)
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body || '{}'))
+      } catch {
+        resolve({})
+      }
+    })
+  })
+}
+
+// --- IPC Interface for simulated Camera tab ---
+ipcMain.handle('get-camera-status', () => {
+  return {
+    active: cameraServer !== null,
+    port: cameraState.port,
+    host: cameraState.host,
+    logs: cameraLogs,
+    state: cameraState
+  }
+})
+
+ipcMain.handle('start-camera-server', (_event, { host, port }) => {
+  if (cameraServer) {
+    return { success: true, msg: "Cutter Camera Server already running." }
+  }
+
+  cameraState.host = host || '127.0.0.1'
+  cameraState.port = port || 8888
+
+  try {
+    startCameraOffscreen()
+
+    cameraServer = http.createServer(async (req, res) => {
+      // Enable CORS for frontend clients
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200)
+        res.end()
+        return
+      }
+
+      const parsedUrl = new URL(req.url || '', `http://${req.headers.host}`)
+      const pathname = parsedUrl.pathname
+
+      // ROUTE: Get live MJPEG stream
+      if (pathname === '/cutter-cam/video' && req.method === 'GET') {
+        logCameraMessage(`GET /cutter-cam/video - Start MJPEG stream`)
+        res.writeHead(200, {
+          'Age': '0',
+          'Cache-Control': 'no-cache, private',
+          'Pragma': 'no-cache',
+          'Content-Type': 'multipart/x-mixed-replace; boundary=FRAME'
+        })
+
+        const boundary = '\r\n--FRAME\r\nContent-Type: image/jpeg\r\nContent-Length: '
+        const streamInterval = setInterval(() => {
+          if (res.writableEnded) {
+            clearInterval(streamInterval)
+            return
+          }
+          const frame = cameraFrameBuffer
+          if (frame && frame.length > 0) {
+            try {
+              res.write(boundary + frame.length + '\r\n\r\n')
+              res.write(frame)
+              res.write('\r\n')
+            } catch {
+              clearInterval(streamInterval)
+            }
+          }
+        }, 100)
+
+        req.on('close', () => {
+          clearInterval(streamInterval)
+          logCameraMessage(`Closed MJPEG stream`)
+        })
+        return
+      }
+
+      // ROUTE: Check availability
+      if (pathname === '/cutter-cam/is-api-available' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isApiAvailable: true }))
+        return
+      }
+
+      // ROUTE: Check recording state
+      if (pathname === '/cutter-cam/is-video-recording' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isVideoRecording: cameraState.is_recording }))
+        return
+      }
+
+      // ROUTE: Temperature
+      if (pathname === '/cutter-cam/temperature' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ camera_processor_temperature_c: cameraState.temperature }))
+        return
+      }
+
+      // ROUTE: Config / State
+      if (pathname === '/cutter-cam/config' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          rgbQualityOptions: ['low', 'medium', 'high', 'ultra'],
+          segmentationModeOptions: ['off', 'on'],
+          rgbResolutionOptions: ['640x480', '1280x720', '1920x1080'],
+          cameraModel: 'IMX519 Simulated',
+          isStereo: false,
+          autofocus: true,
+          resolution: cameraState.video_resolution,
+          quality: cameraState.video_quality
+        }))
+        return
+      }
+
+      if (pathname === '/cutter-cam/state' && req.method === 'GET') {
+        const count = fs.readdirSync(capturedImagesDir).filter(f => f.toLowerCase().endsWith('.jpeg') || f.toLowerCase().endsWith('.jpg')).length
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({
+          currentImageCount: count,
+          isVideoRecording: cameraState.is_recording,
+          isApiAvailable: true,
+          currentRgbResolutionName: cameraState.video_resolution,
+          currentRgbQualityName: cameraState.video_quality,
+          cameraProcessorTemperatureC: cameraState.temperature,
+          availableDiskSpaceGb: 45.2,
+          segmentationMode: 'off',
+          isCameraReloadRequired: false,
+          isCameraReloading: false,
+          
+          // Legacy snake_case fields for frontend UI config mapping
+          current_species: cameraState.species,
+          current_angler_position: cameraState.angler_position,
+          current_drop_number: cameraState.drop_number,
+          current_hook_number: cameraState.hook_number,
+          current_site_number: cameraState.site_number
+        }))
+        return
+      }
+
+      // ROUTE: Set Species
+      if (pathname === '/cutter-cam/set-species' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        cameraState.species = (payload.species || 'UNKNOWN').toUpperCase()
+        logCameraMessage(`POST /cutter-cam/set-species -> "${cameraState.species}"`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isSpeciesSet: true, species: cameraState.species }))
+        return
+      }
+
+      // ROUTE: Set Angler Position
+      if (pathname === '/cutter-cam/set-angler-position' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        cameraState.angler_position = (payload.angler_position || '1').toString()
+        logCameraMessage(`POST /cutter-cam/set-angler-position -> "${cameraState.angler_position}"`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isAnglerPositionSet: true, angler_position: cameraState.angler_position }))
+        return
+      }
+
+      // ROUTE: Set Drop Number
+      if (pathname === '/cutter-cam/set-drop-number' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        cameraState.drop_number = (payload.drop_number || '1').toString()
+        logCameraMessage(`POST /cutter-cam/set-drop-number -> "${cameraState.drop_number}"`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isDropNumberSet: true, drop_number: cameraState.drop_number }))
+        return
+      }
+
+      // ROUTE: Set Hook Number
+      if (pathname === '/cutter-cam/set-hook-number' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        cameraState.hook_number = (payload.hook_number || '1').toString()
+        logCameraMessage(`POST /cutter-cam/set-hook-number -> "${cameraState.hook_number}"`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isHookNumberSet: true, hook_number: cameraState.hook_number }))
+        return
+      }
+
+      // ROUTE: Set Site Number
+      if (pathname === '/cutter-cam/set-site-number' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        cameraState.site_number = (payload.site_number || '1').toString()
+        logCameraMessage(`POST /cutter-cam/set-site-number -> "${cameraState.site_number}"`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ isSiteNumberSet: true, site_number: cameraState.site_number }))
+        return
+      }
+
+      // ROUTE: Camera stream triggers
+      if (pathname === '/cutter-cam/start-video' && req.method === 'POST') {
+        cameraState.is_recording = true
+        logCameraMessage(`POST /cutter-cam/start-video - Started stream`)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true }))
+        return
+      }
+
+      if (pathname === '/cutter-cam/stop-video' && req.method === 'POST') {
+        cameraState.is_recording = false
+        logCameraMessage(`POST /cutter-cam/stop-video - Paused stream`)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true }))
+        return
+      }
+
+      // ROUTE: Flip vertical/horizontal
+      if (pathname === '/cutter-cam/flip-vertical' && req.method === 'POST') {
+        cameraState.vflip = !cameraState.vflip
+        logCameraMessage(`POST /cutter-cam/flip-vertical -> vflip=${cameraState.vflip}`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true }))
+        return
+      }
+
+      if (pathname === '/cutter-cam/flip-horizontal' && req.method === 'POST') {
+        cameraState.hflip = !cameraState.hflip
+        logCameraMessage(`POST /cutter-cam/flip-horizontal -> hflip=${cameraState.hflip}`)
+        updateCameraOffscreenContent()
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: true }))
+        return
+      }
+
+      // ROUTE: Capture Still Frame
+      if (pathname === '/cutter-cam/capture' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        const filename = payload.file_name || `capture_${Date.now()}.jpeg`
+        const filepath = path.join(capturedImagesDir, filename)
+
+        logCameraMessage(`POST /cutter-cam/capture -> saving as "${filename}"`)
+        if (cameraFrameBuffer && cameraFrameBuffer.length > 0) {
+          try {
+            fs.writeFileSync(filepath, cameraFrameBuffer)
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({
+              file_captured: true,
+              file_name: filename,
+              file_path: filepath
+            }))
+            return
+          } catch (err: any) {
+            logCameraMessage(`Capture Error: ${err.message}`)
+          }
+        }
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ detail: "Failed to write frame buffer." }))
+        return
+      }
+
+      // ROUTE: Image Count
+      if (pathname === '/cutter-cam/image-count' && req.method === 'GET') {
+        const count = fs.readdirSync(capturedImagesDir).filter(f => f.toLowerCase().endsWith('.jpeg') || f.toLowerCase().endsWith('.jpg')).length
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ current_image_count: count }))
+        return
+      }
+
+      // ROUTE: Clear image files
+      if (pathname === '/cutter-cam/clear-image-files' && req.method === 'POST') {
+        const payload = await parseJSONBody(req)
+        if (payload.secret_key === 'D3l3t3ME!') {
+          const files = fs.readdirSync(capturedImagesDir)
+          for (const f of files) {
+            try {
+              fs.unlinkSync(path.join(capturedImagesDir, f))
+            } catch {}
+          }
+          logCameraMessage(`POST /cutter-cam/clear-image-files - Cleared all captured images`)
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ success: true }))
+          return
+        }
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ success: false, detail: "Invalid secret key." }))
+        return
+      }
+
+      // ROUTE: Download Images as ZIP
+      if (pathname === '/cutter-cam/download-images' && req.method === 'GET') {
+        const lastTimestampStr = parsedUrl.searchParams.get('last_timestamp_str')
+        logCameraMessage(`GET /cutter-cam/download-images - last_timestamp_str=${lastTimestampStr}`)
+
+        let files = fs.readdirSync(capturedImagesDir)
+          .filter(f => f.toLowerCase().endsWith('.jpeg') || f.toLowerCase().endsWith('.jpg'))
+
+        if (lastTimestampStr) {
+          files = files.filter(f => {
+            const match = f.match(/_HD_(\d{8}T\d{6})/i)
+            if (match) {
+              const fileTimestamp = match[1]
+              return fileTimestamp > lastTimestampStr
+            }
+            return true // return if no timestamp parsed to be safe
+          })
+        }
+
+        const absolutePaths = files.map(f => path.join(capturedImagesDir, f))
+        zipFiles(absolutePaths, res)
+        return
+      }
+
+      // ROUTE: Download single image inside a ZIP
+      if (pathname === '/cutter-cam/download-image' && req.method === 'GET') {
+        const imageName = parsedUrl.searchParams.get('image_name')
+        logCameraMessage(`GET /cutter-cam/download-image - requested image_name=${imageName}`)
+
+        if (imageName && fs.existsSync(path.join(capturedImagesDir, imageName))) {
+          zipFiles([path.join(capturedImagesDir, imageName)], res)
+        } else {
+          res.writeHead(404, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ detail: "Image not found." }))
+        }
+        return
+      }
+
+      // ROUTE: Download today's images inside a ZIP
+      if (pathname === '/cutter-cam/download-todays-images' && req.method === 'GET') {
+        logCameraMessage(`GET /cutter-cam/download-todays-images`)
+        const lastNight = new Date().setHours(0, 0, 1, 0)
+
+        const files = fs.readdirSync(capturedImagesDir)
+          .filter(f => {
+            const p = path.join(capturedImagesDir, f)
+            const stat = fs.statSync(p)
+            return stat.ctimeMs > lastNight
+          })
+          .map(f => path.join(capturedImagesDir, f))
+
+        zipFiles(files, res)
+        return
+      }
+
+      // ROUTE: Retrieve journals logs list
+      if (pathname === '/cutter-cam/logs' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(cameraLogs))
+        return
+      }
+
+      // Default route
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ detail: "Endpoint not found." }))
+    })
+
+    cameraServer.listen(cameraState.port, cameraState.host, () => {
+      logCameraMessage(`Cutter Camera Simulator REST/MJPEG Server listening on http://${cameraState.host}:${cameraState.port}`)
+    })
+
+    // Random temperature fluctuate simulation loop
+    const tempInterval = setInterval(() => {
+      if (!cameraServer) {
+        clearInterval(tempInterval)
+        return
+      }
+      cameraState.temperature = 34.0 + Math.random() * 1.5
+      updateCameraOffscreenContent()
+    }, 5000)
+
+    return { success: true, msg: `Simulated Camera running on http://${cameraState.host}:${cameraState.port}` }
+  } catch (err: any) {
+    stopCameraOffscreen()
+    cameraServer = null
+    return { success: false, msg: `Failed to start Camera Server: ${err.message}` }
+  }
+})
+
+ipcMain.handle('stop-camera-server', () => {
+  if (cameraServer) {
+    cameraServer.close()
+    cameraServer = null
+  }
+  stopCameraOffscreen()
+  logCameraMessage(`Cutter Camera Server stopped.`)
+  return true
 })
