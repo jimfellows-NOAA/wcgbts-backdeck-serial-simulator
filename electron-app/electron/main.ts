@@ -8,6 +8,9 @@ import child_process from 'node:child_process'
 import os from 'node:os'
 import http from 'node:http'
 
+// Disable GPU shader cache to prevent cache lock or access denied (0x5) errors on startup on restricted Windows profiles
+app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
+
 // --- JSON Configuration Storage ---
 const configPath = path.join(app.getPath('userData'), 'vessel_simulator_config.json')
 
@@ -78,6 +81,7 @@ interface BroadcastPort {
   host?: string
   netPort?: number
   sentences: string[]
+  paused?: boolean
 }
 
 interface PortRunnerInstance {
@@ -158,7 +162,8 @@ function startPortRunner(portConfig: BroadcastPort) {
     }
 
     runner.interval = setInterval(() => {
-      if (state.current_mode !== 'Simulation' || runner.serFd === null || runner.serFd === undefined) {
+      const activePort = state.active_ports[portConfig.id]
+      if (state.current_mode !== 'Simulation' || !activePort || activePort.paused || runner.serFd === null || runner.serFd === undefined) {
         return
       }
 
@@ -196,7 +201,8 @@ function startPortRunner(portConfig: BroadcastPort) {
     runner.udpSocket = udpSocket
 
     runner.interval = setInterval(() => {
-      if (state.current_mode !== 'Simulation') {
+      const activePort = state.active_ports[portConfig.id]
+      if (state.current_mode !== 'Simulation' || !activePort || activePort.paused) {
         return
       }
 
@@ -239,7 +245,8 @@ function startPortRunner(portConfig: BroadcastPort) {
     runner.connectedSockets = connectedSockets
 
     runner.interval = setInterval(() => {
-      if (state.current_mode !== 'Simulation') {
+      const activePort = state.active_ports[portConfig.id]
+      if (state.current_mode !== 'Simulation' || !activePort || activePort.paused) {
         return
       }
 
@@ -429,22 +436,31 @@ app.whenReady().then(() => {
         const deviceName = p.device || 'GPS'
         const defaultSentences = DEVICE_GROUPS[deviceName] || []
         const mappedProto = p.protocol || 'UDP'
-        
+
+        const rawPort = p.comPort || (mappedProto === 'SERIAL' ? (p.port ? `COM${p.port - 6000}` : 'COM13') : undefined)
+        const netPort = p.netPort || (mappedProto !== 'SERIAL' ? (p.port || 10110) : undefined)
+        const endpoint = mappedProto === 'SERIAL' ? rawPort : netPort
+        const deterministicId = `${mappedProto}_${endpoint}_${deviceName}`.replace(/[^a-zA-Z0-9_]/g, '_')
+
         const sanitized: BroadcastPort = {
           ...p,
-          id: p.id || Math.random().toString(36).substring(2, 9),
+          id: p.id || deterministicId,
           sentences: p.sentences || defaultSentences,
           protocol: mappedProto,
           comPort: p.comPort || (mappedProto === 'SERIAL' ? (p.port ? `COM${p.port - 6000}` : 'COM13') : undefined),
           netPort: p.netPort || (mappedProto !== 'SERIAL' ? (p.port || 10110) : undefined),
-          host: p.host || '127.0.0.1'
+          host: p.host || '127.0.0.1',
+          paused: p.paused !== undefined ? p.paused : false
         }
-        
+
         sanitizedList.push(sanitized)
-        startPortRunner(sanitized)
+
+        // Crucial: Register in state active_ports BEFORE starting runner so setInterval immediately has access to it!
         state.active_ports[sanitized.id] = sanitized
+
+        startPortRunner(sanitized)
       }
-      
+
       // Update config store immediately with cleaned data so legacy formats are migrated forever
       config.vessel_ports = sanitizedList
       saveConfigData(config)
@@ -947,6 +963,46 @@ ipcMain.on('steer-right', () => {
   logMessage(`[VesselSim] Steered 5° RIGHT. New heading: ${state.vessel.track.toFixed(1)}°`)
 })
 
+ipcMain.on('update-vessel-heading', (_event, heading) => {
+  const h = (parseFloat(heading) + 360) % 360
+  state.vessel.track = h
+  state.vessel.heading = h
+  logMessage(`[VesselSim] Set heading directly to ${h.toFixed(1)}°`)
+})
+
+ipcMain.handle('toggle-vessel-port-pause', (_event, { id, paused }) => {
+  const activePort = state.active_ports[id]
+  if (activePort) {
+    activePort.paused = paused
+    
+    const config = loadConfigData()
+    const portsList: BroadcastPort[] = config.vessel_ports || []
+    const idx = portsList.findIndex(p => p.id === id)
+    if (idx >= 0) {
+      portsList[idx].paused = paused
+    }
+    config.vessel_ports = portsList
+    saveConfigData(config)
+    
+    return { success: true }
+  }
+  return { success: false, msg: 'Active port not found' }
+})
+
+ipcMain.handle('set-all-vessel-ports-paused', (_event, paused) => {
+  for (const id of Object.keys(state.active_ports)) {
+    state.active_ports[id].paused = paused
+  }
+  const config = loadConfigData()
+  const portsList: BroadcastPort[] = config.vessel_ports || []
+  for (const p of portsList) {
+    p.paused = paused
+  }
+  config.vessel_ports = portsList
+  saveConfigData(config)
+  return { success: true }
+})
+
 ipcMain.on('update-vessel-coords', (_event, { lat, lon }) => {
   state.vessel.lat = parseFloat(lat)
   state.vessel.lon = parseFloat(lon)
@@ -976,15 +1032,17 @@ ipcMain.on('start-vessel-sim', () => {
   state.current_mode = 'Simulation'
   logMessage('[VesselSim] 10Hz native simulation engine started.')
 
-  let track = Math.random() * 360
+  state.vessel.track = Math.random() * 360
+  state.vessel.heading = state.vessel.track
   let loopCounter = 0
 
   simInterval = setInterval(() => {
+    let track = state.vessel.track
     // Kinematics updates
     const speedKts = state.vessel.default_speed * (Math.random() * 0.2 + 0.9)
     const metersPerSec = speedKts * 0.514444
     if (speedKts > 0) {
-      track = (track + (Math.random() * 2 - 1)) % 360
+      track = (track + (Math.random() * 2 - 1) + 360) % 360
     }
 
     const [nLat, nLon] = calculate_destination(state.vessel.lat, state.vessel.lon, track, metersPerSec * 0.1)
@@ -1112,9 +1170,12 @@ ipcMain.handle('add-vessel-port', (_event, portConfig: BroadcastPort) => {
       portConfig.id = Math.random().toString(36).substring(2, 9)
     }
 
-    startPortRunner(portConfig)
+    portConfig.paused = portConfig.paused !== undefined ? portConfig.paused : false
 
+    // Crucial: Register in state active_ports BEFORE starting runner so setInterval immediately has access to it!
     state.active_ports[portConfig.id] = portConfig
+
+    startPortRunner(portConfig)
 
     const config = loadConfigData()
     const portsList: BroadcastPort[] = config.vessel_ports || []
@@ -1464,28 +1525,69 @@ function updateCameraOffscreenContent() {
     </head>
     <body>
       <div class="container">
-        <img class="bg-img ${cameraState.vflip ? (cameraState.hflip ? 'flip-vh' : 'flip-v') : (cameraState.hflip ? 'flip-h' : '')}" src="data:image/jpeg;base64,${cowcodBase64}" />
+        <img class="bg-img" id="camera-bg-img" src="data:image/jpeg;base64,${cowcodBase64}" />
         
         <div class="hud-overlay">
-          <div class="hud-item"><span>SPECIES:</span> <span class="hud-val">${cameraState.species}</span></div>
-          <div class="hud-item"><span>ANGLER:</span> <span class="hud-val">${cameraState.angler_position}</span></div>
-          <div class="hud-item"><span>DROP NUM:</span> <span class="hud-val">${cameraState.drop_number}</span></div>
-          <div class="hud-item"><span>HOOK NUM:</span> <span class="hud-val">${cameraState.hook_number}</span></div>
-          <div class="hud-item"><span>SITE NUM:</span> <span class="hud-val">${cameraState.site_number}</span></div>
+          <div class="hud-item"><span>SPECIES:</span> <span class="hud-val" id="species-val"></span></div>
+          <div class="hud-item"><span>ANGLER:</span> <span class="hud-val" id="angler-val"></span></div>
+          <div class="hud-item"><span>DROP NUM:</span> <span class="hud-val" id="drop-val"></span></div>
+          <div class="hud-item"><span>HOOK NUM:</span> <span class="hud-val" id="hook-val"></span></div>
+          <div class="hud-item"><span>SITE NUM:</span> <span class="hud-val" id="site-val"></span></div>
           <div style="border-top: 1.5px solid #047857; margin-top: 6px; padding-top: 6px;" class="hud-item">
-            <span>TEMP:</span> <span class="hud-val">${cameraState.temperature.toFixed(1)}°C</span>
+            <span>TEMP:</span> <span class="hud-val" id="temp-val"></span>
           </div>
-          <div class="hud-item"><span>TIME:</span> <span class="hud-val">${new Date().toISOString().replace('T', ' ').substring(0, 19)} UTC</span></div>
+          <div class="hud-item"><span>TIME:</span> <span class="hud-val" id="time-val"></span></div>
         </div>
         
         <div class="watermark">
           SIMULATED RPI OVERHEAD CAM (IMX519)
         </div>
       </div>
+      
+      <script>
+        function updateTime() {
+          const timeVal = document.getElementById('time-val');
+          if (timeVal) {
+            const now = new Date();
+            timeVal.textContent = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+          }
+        }
+        setInterval(updateTime, 100);
+        updateTime();
+
+        window.updateState = (state) => {
+          document.getElementById('species-val').textContent = state.species;
+          document.getElementById('angler-val').textContent = state.angler_position;
+          document.getElementById('drop-val').textContent = state.drop_number;
+          document.getElementById('hook-val').textContent = state.hook_number;
+          document.getElementById('site-val').textContent = state.site_number;
+          document.getElementById('temp-val').textContent = state.temperature.toFixed(1) + '°C';
+          
+          const img = document.getElementById('camera-bg-img');
+          if (img) {
+            let cls = 'bg-img';
+            if (state.vflip && state.hflip) cls += ' flip-vh';
+            else if (state.vflip) cls += ' flip-v';
+            else if (state.hflip) cls += ' flip-h';
+            img.className = cls;
+          }
+        };
+      </script>
     </body>
     </html>
   `
   cameraOffscreenWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+}
+
+function updateCameraOffscreenState() {
+  if (cameraOffscreenWindow && !cameraOffscreenWindow.isDestroyed()) {
+    const stateStr = JSON.stringify(cameraState)
+    cameraOffscreenWindow.webContents.executeJavaScript(`
+      if (typeof window.updateState === 'function') {
+        window.updateState(${stateStr});
+      }
+    `).catch(() => {})
+  }
 }
 
 function startCameraOffscreen() {
@@ -1500,6 +1602,10 @@ function startCameraOffscreen() {
       nodeIntegration: false,
       contextIsolation: true
     }
+  })
+
+  cameraOffscreenWindow.webContents.once('did-finish-load', () => {
+    updateCameraOffscreenState()
   })
 
   updateCameraOffscreenContent()
@@ -1701,7 +1807,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
         const payload = await parseJSONBody(req)
         cameraState.species = (payload.species || 'UNKNOWN').toUpperCase()
         logCameraMessage(`POST /cutter-cam/set-species -> "${cameraState.species}"`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ isSpeciesSet: true, species: cameraState.species }))
         return
@@ -1712,7 +1818,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
         const payload = await parseJSONBody(req)
         cameraState.angler_position = (payload.angler_position || '1').toString()
         logCameraMessage(`POST /cutter-cam/set-angler-position -> "${cameraState.angler_position}"`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ isAnglerPositionSet: true, angler_position: cameraState.angler_position }))
         return
@@ -1723,7 +1829,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
         const payload = await parseJSONBody(req)
         cameraState.drop_number = (payload.drop_number || '1').toString()
         logCameraMessage(`POST /cutter-cam/set-drop-number -> "${cameraState.drop_number}"`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ isDropNumberSet: true, drop_number: cameraState.drop_number }))
         return
@@ -1734,7 +1840,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
         const payload = await parseJSONBody(req)
         cameraState.hook_number = (payload.hook_number || '1').toString()
         logCameraMessage(`POST /cutter-cam/set-hook-number -> "${cameraState.hook_number}"`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ isHookNumberSet: true, hook_number: cameraState.hook_number }))
         return
@@ -1745,7 +1851,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
         const payload = await parseJSONBody(req)
         cameraState.site_number = (payload.site_number || '1').toString()
         logCameraMessage(`POST /cutter-cam/set-site-number -> "${cameraState.site_number}"`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ isSiteNumberSet: true, site_number: cameraState.site_number }))
         return
@@ -1772,7 +1878,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
       if (pathname === '/cutter-cam/flip-vertical' && req.method === 'POST') {
         cameraState.vflip = !cameraState.vflip
         logCameraMessage(`POST /cutter-cam/flip-vertical -> vflip=${cameraState.vflip}`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ success: true }))
         return
@@ -1781,7 +1887,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
       if (pathname === '/cutter-cam/flip-horizontal' && req.method === 'POST') {
         cameraState.hflip = !cameraState.hflip
         logCameraMessage(`POST /cutter-cam/flip-horizontal -> hflip=${cameraState.hflip}`)
-        updateCameraOffscreenContent()
+        updateCameraOffscreenState()
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ success: true }))
         return
@@ -1919,7 +2025,7 @@ ipcMain.handle('start-camera-server', (_event, { host, port }) => {
         return
       }
       cameraState.temperature = 34.0 + Math.random() * 1.5
-      updateCameraOffscreenContent()
+      updateCameraOffscreenState()
     }, 5000)
 
     return { success: true, msg: `Simulated Camera running on http://${cameraState.host}:${cameraState.port}` }

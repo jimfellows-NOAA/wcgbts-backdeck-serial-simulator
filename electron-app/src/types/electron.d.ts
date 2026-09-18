@@ -8,6 +8,7 @@ export interface BroadcastPort {
   host?: string;
   netPort?: number;
   sentences: string[];
+  paused?: boolean;
 }
 
 export interface IElectronAPI {
@@ -39,6 +40,9 @@ export interface IElectronAPI {
   steerRight: () => void;
   updateVesselCoords: (lat: number, lon: number) => void;
   toggleVesselBreadcrumbs: (enabled: boolean) => void;
+  updateVesselHeading: (heading: number) => void;
+  toggleVesselPortPause: (id: string, paused: boolean) => Promise<{ success: boolean, msg?: string }>;
+  setAllVesselPortsPaused: (paused: boolean) => Promise<{ success: boolean, msg?: string }>;
   addVesselPort: (portConfig: BroadcastPort) => Promise<{ success: boolean, msg: string }>;
   removeVesselPort: (id: string) => Promise<boolean>;
   onVesselState: (callback: (state: any) => void) => () => void;

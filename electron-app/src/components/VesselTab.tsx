@@ -21,6 +21,7 @@ interface BroadcastPort {
   host?: string
   netPort?: number
   sentences: string[]
+  paused?: boolean
 }
 
 interface VesselState {
@@ -67,6 +68,80 @@ export default function VesselTab() {
   const [depthVal, setDepthVal] = useState(300.0)
   const [tempVal, setTempVal] = useState(12.0)
   const [mapZoom, setMapZoom] = useState(5000.0) // pixels per degree
+
+  const dialRef = useRef<SVGSVGElement>(null)
+  const [isDraggingHeading, setIsDraggingHeading] = useState(false)
+
+  const handleHeadingPointerDown = (e: React.MouseEvent<SVGSVGElement> | React.TouchEvent<SVGSVGElement>) => {
+    setIsDraggingHeading(true)
+    updateHeadingFromEvent(e)
+  }
+
+  const updateHeadingFromEvent = (e: any) => {
+    const dial = dialRef.current
+    if (!dial) return
+    const rect = dial.getBoundingClientRect()
+    const centerX = rect.left + rect.width / 2
+    const centerY = rect.top + rect.height / 2
+    
+    let clientX = 0
+    let clientY = 0
+    if (e.touches && e.touches[0]) {
+      clientX = e.touches[0].clientX
+      clientY = e.touches[0].clientY
+    } else {
+      clientX = e.clientX
+      clientY = e.clientY
+    }
+
+    const dx = clientX - centerX
+    const dy = clientY - centerY
+    const angleRad = Math.atan2(dx, -dy)
+    let headingDeg = (angleRad * 180 / Math.PI + 360) % 360
+    headingDeg = Math.round(headingDeg)
+    
+    setVessel(prev => ({ ...prev, heading: headingDeg }))
+    window.electronAPI.updateVesselHeading(headingDeg)
+  }
+
+  useEffect(() => {
+    if (!isDraggingHeading) return
+
+    const handlePointerMove = (e: PointerEvent) => {
+      updateHeadingFromEvent(e)
+    }
+
+    const handlePointerUp = () => {
+      setIsDraggingHeading(false)
+    }
+
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handlePointerUp)
+
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handlePointerUp)
+    }
+  }, [isDraggingHeading])
+
+  const togglePortPause = async (id: string, currentPaused: boolean) => {
+    const nextPaused = !currentPaused
+    const res = await window.electronAPI.toggleVesselPortPause(id, nextPaused)
+    if (res.success) {
+      const updated = broadcastPorts.map((p) => p.id === id ? { ...p, paused: nextPaused } : p)
+      setBroadcastPorts(updated)
+      window.electronAPI.saveConfig('vessel_ports', updated)
+    }
+  }
+
+  const setAllPortsPaused = async (paused: boolean) => {
+    const res = await window.electronAPI.setAllVesselPortsPaused(paused)
+    if (res.success) {
+      const updated = broadcastPorts.map((p) => ({ ...p, paused }))
+      setBroadcastPorts(updated)
+      window.electronAPI.saveConfig('vessel_ports', updated)
+    }
+  }
 
   const [averages, setAverages] = useState({
     hdg: 0.0,
@@ -271,14 +346,21 @@ export default function VesselTab() {
           const deviceName = p.device || 'GPS'
           const defaultSentences = DEVICE_GROUPS[deviceName] || []
           const mappedProto = p.protocol || 'UDP'
+
+          const rawPort = p.comPort || (mappedProto === 'SERIAL' ? (p.port ? `COM${p.port - 6000}` : 'COM13') : undefined)
+          const netPort = p.netPort || (mappedProto !== 'SERIAL' ? (p.port || 10110) : undefined)
+          const endpoint = mappedProto === 'SERIAL' ? rawPort : netPort
+          const deterministicId = `${mappedProto}_${endpoint}_${deviceName}`.replace(/[^a-zA-Z0-9_]/g, '_')
+
           return {
             ...p,
-            id: p.id || Math.random().toString(36).substring(2, 9),
+            id: p.id || deterministicId,
             sentences: p.sentences || defaultSentences,
             protocol: mappedProto,
             comPort: p.comPort || (mappedProto === 'SERIAL' ? (p.port ? `COM${p.port - 6000}` : 'COM13') : undefined),
             netPort: p.netPort || (mappedProto !== 'SERIAL' ? (p.port || 10110) : undefined),
-            host: p.host || '127.0.0.1'
+            host: p.host || '127.0.0.1',
+            paused: p.paused !== undefined ? p.paused : false
           }
         })
         setBroadcastPorts(sanitized)
@@ -778,7 +860,8 @@ export default function VesselTab() {
       baud: newProtocol === 'SERIAL' ? parseInt(newBaud) : undefined,
       host: newProtocol !== 'SERIAL' ? newHost.trim() : undefined,
       netPort: newProtocol !== 'SERIAL' ? parseInt(newNetPort) : undefined,
-      sentences: selectedSentences
+      sentences: selectedSentences,
+      paused: false
     }
 
     const res = await window.electronAPI.addVesselPort(newBPort)
@@ -802,13 +885,6 @@ export default function VesselTab() {
     <div className="flex flex-col h-full gap-3 overflow-hidden">
       {/* --- TOP CONTROL HEADER --- */}
       <div className="flex flex-wrap items-center gap-4 p-4 bg-gray-900 border border-gray-800 rounded-lg shadow-sm shrink-0">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-gray-400 font-semibold">Source Mode:</span>
-          <select value="Simulation" disabled className="bg-gray-800 border border-gray-700/60 rounded px-2.5 py-1 text-xs text-gray-300 font-semibold cursor-pointer">
-            <option value="Simulation">Simulation</option>
-          </select>
-        </div>
-
         <button
           onClick={handleStart}
           disabled={vessel.mode !== 'Idle'}
@@ -826,7 +902,7 @@ export default function VesselTab() {
         </button>
 
         {/* Speed Adjustment */}
-        <div className="flex items-center gap-2 flex-grow max-w-[340px]">
+        <div className="flex items-center gap-2 flex-grow max-w-[260px]">
           <span className="text-xs text-gray-400 font-semibold shrink-0">Speed:</span>
           <input
             type="range"
@@ -838,39 +914,39 @@ export default function VesselTab() {
             className="flex-grow accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
           />
           <span className="text-xs font-mono font-bold text-orange-400 w-12 text-right">{speedVal.toFixed(1)} kts</span>
-          
-          {/* Steering Buttons */}
-          <div className="flex items-center gap-0.5 ml-1 shrink-0">
-            <button
-              onClick={() => window.electronAPI.steerLeft()}
-              title="Steer Left"
-              className="px-1.5 py-0.5 bg-gray-800 hover:bg-gray-750 text-gray-300 hover:text-orange-400 border border-gray-700/60 rounded text-[10px] font-bold active:scale-95 transition cursor-pointer"
-            >
-              ◀
-            </button>
-            <button
-              onClick={() => window.electronAPI.steerRight()}
-              title="Steer Right"
-              className="px-1.5 py-0.5 bg-gray-800 hover:bg-gray-750 text-gray-300 hover:text-orange-400 border border-gray-700/60 rounded text-[10px] font-bold active:scale-95 transition cursor-pointer"
-            >
-              ▶
-            </button>
-          </div>
         </div>
 
-        {/* Map Zoom Slider */}
-        <div className="flex items-center gap-2 flex-grow max-w-xs">
-          <span className="text-xs text-gray-400 font-semibold shrink-0">Zoom:</span>
-          <input
-            type="range"
-            min="100"
-            max="30000"
-            step="100"
-            value={mapZoom}
-            onChange={handleZoomSliderChange}
-            className="flex-grow accent-orange-500 cursor-pointer h-1 bg-gray-800 rounded-lg appearance-none"
-          />
-          <span className="text-xs font-mono font-bold text-orange-400 w-16 text-right">x{(mapZoom / 1000).toFixed(1)}</span>
+        {/* Circular Heading Slider */}
+        <div className="flex items-center gap-2 select-none">
+          <span className="text-xs text-gray-400 font-semibold shrink-0">Vessel Heading:</span>
+          <div className="relative flex items-center gap-1.5">
+            <svg
+              ref={dialRef}
+              onMouseDown={handleHeadingPointerDown}
+              onTouchStart={handleHeadingPointerDown}
+              width="36"
+              height="36"
+              className="cursor-pointer overflow-visible select-none touch-none"
+            >
+              {/* Compass Ring */}
+              <circle cx="18" cy="18" r="14" fill="#0b1329" stroke="#334155" strokeWidth="2" />
+              
+              {/* Pointing Needle & Knob Handle */}
+              {(() => {
+                const r = 14
+                const rad = (vessel.heading * Math.PI) / 180
+                const kX = 18 + r * Math.sin(rad)
+                const kY = 18 - r * Math.cos(rad)
+                return (
+                  <>
+                    <line x1="18" y1="18" x2={kX} y2={kY} stroke="#ff4500" strokeWidth="2.5" strokeLinecap="round" />
+                    <circle cx={kX} cy={kY} r="4" fill="#f97316" stroke="#ffffff" strokeWidth="1" />
+                  </>
+                )
+              })()}
+            </svg>
+            <span className="text-xs font-mono font-bold text-orange-400 w-10 text-right">{vessel.heading.toFixed(0)}°</span>
+          </div>
         </div>
 
         <div className="flex items-center gap-2">
@@ -1085,8 +1161,6 @@ export default function VesselTab() {
         <div className="col-span-4 border border-gray-800/60 bg-gray-950 rounded-lg overflow-hidden flex flex-col relative">
           <canvas
             ref={canvasRef}
-            width={320}
-            height={320}
             className="flex-grow w-full h-full block"
             onWheel={(e) => {
               e.preventDefault()
@@ -1257,6 +1331,27 @@ export default function VesselTab() {
             </button>
           </div>
 
+          {/* Active Ports List Header & Global Controls */}
+          <div className="flex justify-between items-center mb-1 shrink-0">
+            <span className="text-[10px] font-bold text-gray-500 uppercase">Active Broadcast Channels</span>
+            {broadcastPorts.length > 0 && (
+              <div className="flex gap-1.5">
+                <button
+                  onClick={() => setAllPortsPaused(false)}
+                  className="px-1.5 py-0.5 bg-emerald-950/40 hover:bg-emerald-900/40 border border-emerald-800 text-emerald-400 rounded text-[9px] font-bold transition cursor-pointer"
+                >
+                  Resume All
+                </button>
+                <button
+                  onClick={() => setAllPortsPaused(true)}
+                  className="px-1.5 py-0.5 bg-amber-950/40 hover:bg-amber-900/40 border border-amber-800 text-amber-400 rounded text-[9px] font-bold transition cursor-pointer"
+                >
+                  Pause All
+                </button>
+              </div>
+            )}
+          </div>
+
           {/* Active Ports List */}
           <div className="flex flex-col gap-1 overflow-y-auto max-h-28 p-1 border-b border-gray-800/40 pb-2 mb-2 shrink-0">
             {broadcastPorts.length === 0 ? (
@@ -1270,18 +1365,36 @@ export default function VesselTab() {
                   <div key={p.id} className="flex justify-between items-center px-2 py-1 bg-gray-950/40 rounded border border-gray-800">
                     <div className="flex flex-col">
                       <span className="font-mono text-[9px] font-bold text-gray-300">
-                        {`${p.device} (${p.protocol}) -> ${label}`}
+                        {p.paused ? (
+                          <span className="text-gray-500 line-through">
+                            {`${p.device} (${p.protocol}) -> ${label}`}
+                          </span>
+                        ) : (
+                          `${p.device} (${p.protocol}) -> ${label}`
+                        )}
                       </span>
                       <span className="text-[8px] text-gray-500">
-                        {p.hz} Hz • {(p.sentences || []).join(', ')}
+                        {p.hz} Hz • {(p.sentences || []).join(', ')} {p.paused && <span className="text-amber-500 font-bold ml-1 uppercase">(Paused)</span>}
                       </span>
                     </div>
-                    <button
-                      onClick={() => removePort(p.id)}
-                      className="px-1.5 py-0.5 border border-rose-800 bg-rose-950/25 hover:bg-rose-900 rounded text-[9px] text-rose-400 font-bold transition cursor-pointer shrink-0 ml-2"
-                    >
-                      Remove
-                    </button>
+                    <div className="flex gap-1 shrink-0 ml-2">
+                      <button
+                        onClick={() => togglePortPause(p.id, !!p.paused)}
+                        className={`px-1.5 py-0.5 border ${
+                          p.paused
+                            ? 'border-emerald-800 bg-emerald-950/25 hover:bg-emerald-900 text-emerald-400'
+                            : 'border-amber-800 bg-amber-950/25 hover:bg-amber-900 text-amber-400'
+                        } rounded text-[9px] font-bold transition cursor-pointer shrink-0`}
+                      >
+                        {p.paused ? 'Resume' : 'Pause'}
+                      </button>
+                      <button
+                        onClick={() => removePort(p.id)}
+                        className="px-1.5 py-0.5 border border-rose-800 bg-rose-950/25 hover:bg-rose-900 rounded text-[9px] text-rose-400 font-bold transition cursor-pointer shrink-0"
+                      >
+                        Remove
+                      </button>
+                    </div>
                   </div>
                 )
               })

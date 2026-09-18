@@ -64,10 +64,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   steerRight: () => ipcRenderer.send('steer-right'),
   updateVesselCoords: (lat: number, lon: number) => ipcRenderer.send('update-vessel-coords', { lat, lon }),
   toggleVesselBreadcrumbs: (enabled: boolean) => ipcRenderer.send('toggle-vessel-breadcrumbs', enabled),
-  
+  updateVesselHeading: (heading: number) => ipcRenderer.send('update-vessel-heading', heading),
+  toggleVesselPortPause: (id: string, paused: boolean) => ipcRenderer.invoke('toggle-vessel-port-pause', { id, paused }),
+  setAllVesselPortsPaused: (paused: boolean) => ipcRenderer.invoke('set-all-vessel-ports-paused', paused),
+
   addVesselPort: (portConfig: any) =>
     ipcRenderer.invoke('add-vessel-port', portConfig),
-  
+
   removeVesselPort: (id: string) =>
     ipcRenderer.invoke('remove-vessel-port', id),
 

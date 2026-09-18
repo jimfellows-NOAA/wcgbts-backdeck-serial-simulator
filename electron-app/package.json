@@ -34,6 +34,12 @@
       "target": "zip",
       "icon": "public/serial_port.ico"
     },
+    "extraResources": [
+      {
+        "from": "../data/maps",
+        "to": "data/maps"
+      }
+    ],
     "files": [
       "dist/**/*",
       "dist-electron/**/*"
